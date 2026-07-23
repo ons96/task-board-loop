@@ -31,7 +31,8 @@
 #   WORKER_ID         explicit worker ID (default: auto-detect gha-/local-)
 #   HEARTBEAT_FILE    path (default: /tmp/agent-loop.heartbeat)
 #   HEARTBEAT_INTERVAL seconds between heartbeat comments (default: 300)
-#   OPENCODE_BIN      opencode binary/wrapper (default: local resilient wrapper when installed, else opencode)
+#   OPENCODE_BIN      opencode binary/wrapper (overrides all defaults)
+#   OPENCODE_HEADLESS set to 1 to use bundled VPS headless wrapper
 #   IDLE_SLEEP        seconds to wait when no work (default: 60)
 #   OPENCODE_TIMEOUT  max seconds per /work (default: 1800 = 30min)
 #   MAX_RETRIES       per-issue retry count on transient failure (default: 2)
@@ -63,8 +64,12 @@ REPO="${REPO:-$PWD}"
 HEARTBEAT_FILE="${HEARTBEAT_FILE:-/tmp/agent-loop.heartbeat}"
 LOG_DIR="${LOG_DIR:-$HOME/.local/state/task-board-loop/logs}"
 mkdir -p "$LOG_DIR"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HEADLESS_OPENCODE_BIN="$SCRIPT_DIR/opencode-headless.sh"
 DEFAULT_OPENCODE_BIN="$HOME/.config/opencode/scripts/opencode-resilient.sh"
-if [ -x "$DEFAULT_OPENCODE_BIN" ]; then
+if [ "${OPENCODE_HEADLESS:-0}" = "1" ] && [ -x "$HEADLESS_OPENCODE_BIN" ]; then
+  OPENCODE_BIN="${OPENCODE_BIN:-$HEADLESS_OPENCODE_BIN}"
+elif [ -x "$DEFAULT_OPENCODE_BIN" ]; then
   OPENCODE_BIN="${OPENCODE_BIN:-$DEFAULT_OPENCODE_BIN}"
 else
   OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
