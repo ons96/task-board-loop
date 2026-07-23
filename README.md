@@ -16,6 +16,7 @@ Autonomous multi-device task worker for [ons96/task-board](https://github.com/on
 ## Files
 
 - `task-board-loop.sh` - main loop: claim issue -> worktree -> /work -> PR -> cleanup
+- `opencode-headless.sh` - bundled pure-mode wrapper for RAM-tight headless hosts (VPS)
 - `task-board-loop-watchdog.service` - systemd unit: kill silent loops
 - `task-board-loop-watchdog.timer` - systemd timer: runs watchdog every 10 min
 
@@ -83,3 +84,34 @@ Set `OPENCODE_BIN=opencode` to bypass the wrapper, or `OPENCODE_RESILIENCE_DISAB
 - Per-issue peak: ~150MB (opencode + npm modules) for up to 30 min
 - Worktree: ~10-50MB per checked-out worktree
 - Concurrent worktrees cap: 3-5 on 1GB VPS (monitor with `du -sh ../worktrees`)
+
+## VPS headless runner
+
+On RAM-tight headless hosts (e.g. 1GB VPS-155), the interactive OpenCode
+config loads global plugins/MCPs that push startup past the loop's short
+timeout. The bundled `opencode-headless.sh` wrapper sidesteps this:
+
+- Sources and exports `~/.env` (so `{env:VPS_GATEWAY_API_KEY}` resolves)
+- Runs `opencode --pure "$@"` (skips external plugins + MCPs, ~25s boot)
+- Validates the binary exists and `VPS_GATEWAY_API_KEY` is nonempty
+- Self-check: `./opencode-headless.sh --self-check` prints `opencode-headless: OK`
+- `OPENCODE_BIN=/path/to/real/opencode` overrides and bypasses the wrapper
+
+Enable in the loop by setting `OPENCODE_HEADLESS=1` (the wrapper is only
+selected when that env is `1` and the bundled file is executable; explicit
+`OPENCODE_BIN` always wins):
+
+```bash
+# PONG smoke (expect <30s, output "PONG"); pick a virtual model with a
+# no-TPM-cap first candidate (agent-oracle -> NVIDIA NIM) since OpenCode's
+# default agent system prompt is ~9k tokens — Groq's 12k TPM free tier rejects it.
+OPENCODE_HEADLESS=1 timeout 120 ./task-board-loop.sh  # then Ctrl-C the loop
+# or test the wrapper directly:
+timeout 120 ./opencode-headless.sh run -m vps-gateway/agent-oracle "reply with exactly: PONG"
+```
+
+Normal interactive OpenCode on the same host is untouched — the wrapper is
+loop-only. Use a virtual model whose first healthy candidate has no free-tier
+TPM cap (e.g. `agent-oracle` / NVIDIA NIM) because OpenCode emits a large
+default agent system prompt plus `tools` and `tool_choice`; small-TPM models
+will return misleading "model not found" errors when the token window is exceeded.
