@@ -37,8 +37,10 @@
 #   OPENCODE_TIMEOUT  max seconds per /work (default: 1800 = 30min)
 #   MAX_RETRIES       per-issue retry count on transient failure (default: 2)
 #   STALE_TIMEOUT     watchdog frees tasks after this many seconds of no heartbeat (default: 600)
+#   TASK_BOARD_REPO   GitHub repo for issue queue (default: ons96/task-board)
 
 set -euo pipefail
+TASK_BOARD_REPO="${TASK_BOARD_REPO:-ons96/task-board}"
 
 # --- args ---
 ONCE=0
@@ -67,12 +69,14 @@ mkdir -p "$LOG_DIR"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 HEADLESS_OPENCODE_BIN="$SCRIPT_DIR/opencode-headless.sh"
 DEFAULT_OPENCODE_BIN="$HOME/.config/opencode/scripts/opencode-resilient.sh"
+# ponytail: hardcode real opencode path so non-interactive tmux shells (no PATH rc) find it
+export OPENCODE_REAL_BIN="${OPENCODE_REAL_BIN:-$HOME/.opencode/bin/opencode}"
 if [ "${OPENCODE_HEADLESS:-0}" = "1" ] && [ -x "$HEADLESS_OPENCODE_BIN" ]; then
   OPENCODE_BIN="${OPENCODE_BIN:-$HEADLESS_OPENCODE_BIN}"
 elif [ -x "$DEFAULT_OPENCODE_BIN" ]; then
   OPENCODE_BIN="${OPENCODE_BIN:-$DEFAULT_OPENCODE_BIN}"
 else
-  OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
+  OPENCODE_BIN="${OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
 fi
 IDLE_SLEEP="${IDLE_SLEEP:-60}"
 OPENCODE_TIMEOUT="${OPENCODE_TIMEOUT:-1800}"
@@ -102,7 +106,7 @@ if [[ ! "$LOCK_LABEL" =~ ^[a-zA-Z0-9_:\.\-]{1,50}$ ]]; then
   exit 1
 fi
 
-[ -d "$REPO/.git" ] || { echo "not a git repo: $REPO" >&2; exit 1; }
+[ -d "$REPO/.git" ] || { echo "warning: launch cwd not a git repo: $REPO (per-issue resolution will be used)" >&2; }
 command -v gh >/dev/null || { echo "gh CLI required" >&2; exit 1; }
 command -v "$OPENCODE_BIN" >/dev/null || { echo "opencode not on PATH" >&2; exit 1; }
 
@@ -114,6 +118,10 @@ mkdir -p "$WORKTREE_DIR"
 
 # Resolve main branch name
 MAIN_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo main)"
+# ponytail: preserve launch values for per-issue fallback (multi-repo task-board)
+LAUNCH_REPO="$REPO"
+LAUNCH_WORKTREE_DIR="$WORKTREE_DIR"
+LAUNCH_MAIN_BRANCH="$MAIN_BRANCH"
 echo "task-board-loop: repo=$REPO main=$MAIN_BRANCH worker=$WORKER_ID lock=$LOCK_LABEL labels=$LABELS worktrees=$WORKTREE_DIR"
 
 # --- counters ---
@@ -135,7 +143,7 @@ heartbeat() {
 GH_TIMEOUT="${GH_TIMEOUT:-30}"
 comment() {
   local n="$1" body="$2"
-  timeout "$GH_TIMEOUT" gh issue comment "$n" --body "$body" >/dev/null 2>&1 || \
+  timeout "$GH_TIMEOUT" gh issue comment "$n" -R "$TASK_BOARD_REPO" --body "$body" >/dev/null 2>&1 || \
     heartbeat "comment on #$n timed out/failed (non-fatal)"
 }
 
@@ -152,9 +160,9 @@ next_issue() {
       | .number
     '
   if [ -n "$l2" ] && [ "$l2" != "$l1" ]; then
-    gh issue list --label "$l1" --label "$l2" --state open --json number,title,labels --limit 100 | jq -r "$jq_filter" | head -1
+    gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --label "$l2" --state open --json number,title,labels --limit 100 | jq -r "$jq_filter" | head -1
   else
-    gh issue list --label "$l1" --state open --json number,title,labels --limit 100 | jq -r "$jq_filter" | head -1
+    gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --state open --json number,title,labels --limit 100 | jq -r "$jq_filter" | head -1
   fi
 }
 
@@ -167,9 +175,9 @@ next_issue() {
 # Returns: 0 if claim succeeded, 1 if lost race or API error
 claim() {
   local n="$1"
-  gh label create "$LOCK_LABEL" --color "BFD4F2" 2>/dev/null || true
+  gh label create "$LOCK_LABEL" -R "$TASK_BOARD_REPO" --color "BFD4F2" 2>/dev/null || true
 
-  if ! gh issue edit "$n" \
+  if ! gh issue edit "$n" -R "$TASK_BOARD_REPO" \
     --add-label "$IN_PROGRESS_LABEL" \
     --add-label "$LOCK_LABEL" \
     --remove-label "status:new" 2>/dev/null; then
@@ -179,12 +187,12 @@ claim() {
   sleep 2
 
   local current_lock
-  current_lock=$(gh issue view "$n" --json labels --jq \
+  current_lock=$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq \
     '[.labels[] | select(.name | startswith("locked-by:")) | .name] | first // ""' 2>/dev/null || echo "")
 
   if [[ "$current_lock" != "$LOCK_LABEL" ]]; then
     heartbeat "issue #$n claimed by '${current_lock:-none}' after we tried, releasing"
-    gh issue edit "$n" \
+    gh issue edit "$n" -R "$TASK_BOARD_REPO" \
       --remove-label "$IN_PROGRESS_LABEL" \
       --remove-label "$LOCK_LABEL" \
       --add-label "status:new" 2>/dev/null || true
@@ -198,7 +206,7 @@ claim() {
 # --- release lock + transition to terminal label ---
 unclaim() {
   local n="$1" label="$2"  # label = $DONE_LABEL | $BLOCKED_LABEL
-  gh issue edit "$n" \
+  gh issue edit "$n" -R "$TASK_BOARD_REPO" \
     --remove-label "$IN_PROGRESS_LABEL" \
     --remove-label "$LOCK_LABEL" \
     --add-label "$label" 2>/dev/null || true
@@ -228,7 +236,7 @@ start_heartbeat_poster() {
     while [ -f "$pid_file" ]; do
       sleep "$HEARTBEAT_INTERVAL"
       [ -f "$pid_file" ] || break
-      timeout "$GH_TIMEOUT" gh issue comment "$issue_num" --body \
+      timeout "$GH_TIMEOUT" gh issue comment "$issue_num" -R "$TASK_BOARD_REPO" --body \
         "heartbeat from \`${WORKER_ID}\` at $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >/dev/null 2>&1 || true
     done
   ) &
@@ -241,11 +249,33 @@ stop_heartbeat_poster() {
   # subshell exits on its own when pid_file disappears
 }
 
+# Resolve target repo for an issue from its project:<repo> label.
+# Overrides globals (REPO/WORKTREE_DIR/etc) per-issue; falls back to launch values.
+# ponytail: mutates globals -- safe because loop is sequential (one do_issue at a time)
+resolve_repo_for_issue() {
+  local n="$1" proj
+  proj="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq '.labels[].name' 2>/dev/null \
+          | grep -oE '^project:[a-z0-9_-]+$' | head -1 | cut -d: -f2)"
+  if [ -n "$proj" ] && [ -d "$HOME/CodingProjects/$proj/.git" ]; then
+    REPO="$HOME/CodingProjects/$proj"
+    REPO_PARENT="$(dirname "$REPO")"
+    REPO_NAME="$(basename "$REPO")"
+    WORKTREE_DIR="$REPO_PARENT/${REPO_NAME}-worktrees"
+    MAIN_BRANCH="$(cd "$REPO" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo main)"
+  else
+    REPO="$LAUNCH_REPO"
+    REPO_PARENT="$(dirname "$REPO")"
+    REPO_NAME="$(basename "$REPO")"
+    WORKTREE_DIR="$LAUNCH_WORKTREE_DIR"
+    MAIN_BRANCH="$LAUNCH_MAIN_BRANCH"
+  fi
+  mkdir -p "$WORKTREE_DIR"
+  cd "$REPO"
+}
+
 # --- run /work on a single issue ---
 do_issue() {
   local n="$1" retry=0
-  local wt="$WORKTREE_DIR/wt-$n"
-  local branch="work/$n"
 
   heartbeat "claiming issue #$n"
   if ! claim "$n"; then
@@ -256,6 +286,11 @@ do_issue() {
 
   # claim success -> ensure we always release the lock on any exit path
   trap "stop_heartbeat_poster '$n'; unclaim '$n' '$BLOCKED_LABEL'" RETURN
+
+  # resolve target repo per-issue (multi-repo task-board support)
+  resolve_repo_for_issue "$n"
+  local wt="$WORKTREE_DIR/wt-$n"
+  local branch="work/$n"
 
   # create worktree
   heartbeat "creating worktree $wt on branch $branch"
@@ -278,7 +313,7 @@ do_issue() {
     else
       cd "$wt"
       local issue_meta
-      issue_meta="$(gh issue view "$n" --json title,body,labels,number --jq '{n:.number,t:.title,b:.body,labs:[.labels[].name]}' 2>/dev/null)"
+      issue_meta="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json title,body,labels,number --jq '{n:.number,t:.title,b:.body,labs:[.labels[].name]}' 2>/dev/null)"
       local prompt
       prompt=$(cat <<EOF
 /work $n
@@ -292,14 +327,14 @@ $(echo "$issue_meta" | jq -r .b)
 EOF
 )
       set +e
-      timeout "$OPENCODE_TIMEOUT" "$OPENCODE_BIN" run "$prompt" 2>&1 | tee "$LOG_DIR/issue-$n.log"
+      timeout "$OPENCODE_TIMEOUT" "$OPENCODE_BIN" run -m "${OPENCODE_MODEL:-vps-gateway/coding-fast}" "$prompt" 2>&1 | tee "$LOG_DIR/issue-$n.log"
       result=${PIPESTATUS[0]}
       set -e
     fi
     if [ "$result" = "0" ]; then
       if [ "$DRY" = "1" ]; then
         heartbeat "dry-run: reverting claim on #$n (back to status:new)"
-        gh issue edit "$n" \
+        gh issue edit "$n" -R "$TASK_BOARD_REPO" \
           --remove-label "$IN_PROGRESS_LABEL" \
           --remove-label "$LOCK_LABEL" \
           --add-label "status:new" 2>/dev/null || true
