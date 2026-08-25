@@ -285,7 +285,8 @@ do_issue() {
   fi
 
   # claim success -> ensure we always release the lock on any exit path
-  trap "stop_heartbeat_poster '$n'; unclaim '$n' '$BLOCKED_LABEL'" RETURN
+  # ponytail: || true inside trap - a failing trap under set -e kills the whole script (seen live: double-unclaim after blocked path exited code 1)
+  trap "stop_heartbeat_poster '$n' 2>/dev/null || true; unclaim '$n' '$BLOCKED_LABEL' 2>/dev/null || true" RETURN
 
   # resolve target repo per-issue (multi-repo task-board support)
   resolve_repo_for_issue "$n"
@@ -295,6 +296,8 @@ do_issue() {
   # create worktree
   heartbeat "creating worktree $wt on branch $branch"
   if ! git worktree add "$wt" -b "$branch" "$MAIN_BRANCH" 2>/dev/null; then
+    # ponytail: branch may exist on remote only (GHA-era work/N) - fetch before reusing it
+    git fetch origin "$branch" 2>/dev/null || true
     git worktree add "$wt" "$branch" 2>/dev/null || {
       comment "$n" "task-board-loop: failed to create worktree, marking blocked"
       unclaim "$n" "$BLOCKED_LABEL"
