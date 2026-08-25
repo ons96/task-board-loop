@@ -253,15 +253,28 @@ stop_heartbeat_poster() {
 # Overrides globals (REPO/WORKTREE_DIR/etc) per-issue; falls back to launch values.
 # ponytail: mutates globals -- safe because loop is sequential (one do_issue at a time)
 resolve_repo_for_issue() {
-  local n="$1" proj
+  local n="$1" proj hit="" d
   proj="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq '.labels[].name' 2>/dev/null \
           | grep -oE '^project:[a-z0-9_-]+$' | head -1 | cut -d: -f2)"
-  if [ -n "$proj" ] && [ -d "$HOME/CodingProjects/$proj/.git" ]; then
-    REPO="$HOME/CodingProjects/$proj"
+  # ponytail: linear dir scan instead of -d test so label case mismatches resolve (project:llm-api-key-proxy -> LLM-API-Key-Proxy)
+  if [ -n "$proj" ]; then
+    for d in "$HOME/CodingProjects"/*/; do
+      [ -e "${d}.git" ] || continue
+      if [ "$(basename "$d" | tr '[:upper:]' '[:lower:]')" = "$proj" ]; then hit="${d%/}"; break; fi
+    done
+  fi
+  if [ -n "$hit" ]; then
+    REPO="$hit"
     REPO_PARENT="$(dirname "$REPO")"
     REPO_NAME="$(basename "$REPO")"
     WORKTREE_DIR="$REPO_PARENT/${REPO_NAME}-worktrees"
-    MAIN_BRANCH="$(cd "$REPO" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo main)"
+    MAIN_BRANCH="$(cd "$REPO" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    # ponytail: origin/HEAD often unset locally; fall back main->master by inspection
+    if [ -z "$MAIN_BRANCH" ]; then
+      if cd "$REPO" && git show-ref --verify --quiet refs/heads/main; then MAIN_BRANCH=main
+      elif git show-ref --verify --quiet refs/heads/master; then MAIN_BRANCH=master
+      else MAIN_BRANCH=$(git rev-parse --abbrev-ref HEAD); fi
+    fi
   else
     REPO="$LAUNCH_REPO"
     REPO_PARENT="$(dirname "$REPO")"
