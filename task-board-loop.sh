@@ -327,7 +327,7 @@ $(echo "$issue_meta" | jq -r .b)
 EOF
 )
       set +e
-      timeout "$OPENCODE_TIMEOUT" "$OPENCODE_BIN" run -m "${OPENCODE_MODEL:-vps-gateway/coding-fast}" "$prompt" 2>&1 | tee "$LOG_DIR/issue-$n.log"
+      timeout "$OPENCODE_TIMEOUT" "$OPENCODE_BIN" run -m "${OPENCODE_MODEL:-opencode_zen/x-preview-f-free}" "$prompt" 2>&1 | tee "$LOG_DIR/issue-$n.log"
       result=${PIPESTATUS[0]}
       set -e
     fi
