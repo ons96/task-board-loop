@@ -70,6 +70,13 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Never force-pushes
 - Never removes worktree with uncommitted changes (leaves for manual review)
 - Heartbeat file written every iteration; watchdog kills silent loops > 30min
+- Stale-lock TTL sweep runs at startup and every `SWEEP_INTERVAL` (default 1800s):
+  other-host `status:in_progress` locks idle longer than `LOCK_TTL` (default
+  172800s = 48h) with no heartbeat-type comment are auto-released back to
+  `status:new` with an explanatory comment; same-host locks are freed only if
+  their PID is dead AND idle longer than `STALE_GRACE` (default 5400s = 90min).
+  The loop never sweeps its own lock. `--dry-run` logs instead of freeing.
+  Self-test: `./task-board-loop.sh --self-test`
 - All actions logged to `/tmp/agent-loop-issue-N.log` + journal
 - Non-interactive OpenCode runs prefer `~/.config/opencode/scripts/opencode-resilient.sh`, which retries only classified transient network/provider/transport failures and logs to `~/.local/state/opencode/resilience/`
 - Issues with missing/blocked deps auto-skipped (see opencode `/work` Phase 0)
