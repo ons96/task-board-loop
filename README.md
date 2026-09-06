@@ -40,6 +40,29 @@ systemctl --user enable --now task-board-loop-watchdog.timer
 ./task-board-loop.sh --dry-run
 ```
 
+## Supervisor on VPS-155 (tmux)
+
+The loop runs 24/7 in tmux on VPS-155 (`oci-agent-vnic`); zero autonomous load on the laptop.
+
+```bash
+# start (from laptop)
+ssh ubuntu@155.248.217.255 'tmux new-session -d -s taskboard-loop -c ~/task-board-loop "env OPENCODE_HEADLESS=1 OPENCODE_MODEL=vps-gateway/coding-fast ./task-board-loop.sh"'
+# watchdog kills silent loops (>30min no heartbeat), every 10min
+ssh ubuntu@155.248.217.255 'systemctl --user enable --now task-board-loop-watchdog.timer'
+# status
+ssh ubuntu@155.248.217.255 'tmux ls | grep taskboard; cat /tmp/agent-loop.heartbeat'
+# restart: pull latest, kill session, start again
+ssh ubuntu@155.248.217.255 'git -C ~/task-board-loop pull --ff-only && tmux kill-session -t taskboard-loop'
+# stop
+ssh ubuntu@155.248.217.255 'tmux kill-session -t taskboard-loop'
+```
+
+Notes:
+
+- `OPENCODE_MODEL` must exist in the device's `opencode.json` (155 uses `vps-gateway/coding-fast`; the default `nous/stealth/ox-alpha` is not configured there).
+- Pre-claim guard: issues whose `project:` repo has no local checkout are skipped (`project:general` / unpinned run in the loop repo).
+- `~/task-board-loop` on 155 is a git clone tracking `origin/main`; `loop-opencode.json` is device-local (untracked).
+
 ## How it works
 
 1. Lists open issues with `status:new`, no assignee, no `locked-by:*`

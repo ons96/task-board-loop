@@ -128,6 +128,16 @@ LAST_SWEEP=0
 # stale_by_ttl now last_live ttl -> 0 (stale) if now-last_live >= ttl, else 1
 stale_by_ttl() { [ "$1" -ge "$(( $2 + $3 ))" ]; }
 
+# repo_available proj -> 0 if this device can work it (unpinned, general, or local checkout present)
+repo_available() {
+  local p
+  p="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [ -z "$p" ] && return 0
+  [ "$p" = "general" ] && return 0
+  [[ ",$HAVE_PROJ," == *",$p,"* ]] && return 0
+  return 1
+}
+
 # lock_same_host lock_label -> 0 if the lock belongs to this host (own worker or hostname substring)
 lock_same_host() {
   local l
@@ -145,6 +155,11 @@ if [ "$SELF_TEST" = "1" ]; then
   check "hostname-substring lock is same-host" lock_same_host "locked-by:local-${MY_HOST_LOWER}"
   check_not "gha lock is other-host" lock_same_host "locked-by:gha-12345"
   check_not "other hostname is other-host" lock_same_host "locked-by:local-someotherhost99"
+  HAVE_PROJ="task-board-loop,vps-gh-agent-loop"
+  check "unpinned issue is available" repo_available ""
+  check "project:general is available" repo_available "general"
+  check "local checkout is available" repo_available "Task-Board-Loop"
+  check_not "missing checkout is unavailable" repo_available "llm-leaderboard-aggregate"
   check "idle past ttl is stale" stale_by_ttl 100 0 50
   check "idle exactly ttl is stale" stale_by_ttl 100 50 50
   check_not "idle within ttl is live" stale_by_ttl 100 60 50
@@ -168,7 +183,13 @@ MAIN_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name
 LAUNCH_REPO="$REPO"
 LAUNCH_WORKTREE_DIR="$WORKTREE_DIR"
 LAUNCH_MAIN_BRANCH="$MAIN_BRANCH"
-echo "task-board-loop: repo=$REPO main=$MAIN_BRANCH worker=$WORKER_ID lock=$LOCK_LABEL labels=$LABELS worktrees=$WORKTREE_DIR"
+# ponytail: pre-claim repo-availability set (#830: 155 ran #834 in the wrong repo via launch fallback)
+HAVE_PROJ="$(basename "$LAUNCH_REPO" | tr '[:upper:]' '[:lower:]')"
+for _d in "$HOME/CodingProjects"/*/; do
+  [ -e "${_d}.git" ] || continue
+  HAVE_PROJ="$HAVE_PROJ,$(basename "$_d" | tr '[:upper:]' '[:lower:]')"
+done
+echo "task-board-loop: repo=$REPO main=$MAIN_BRANCH worker=$WORKER_ID lock=$LOCK_LABEL labels=$LABELS worktrees=$WORKTREE_DIR have=$HAVE_PROJ"
 
 # --- counters ---
 DONE=0
@@ -196,20 +217,22 @@ comment() {
 # --- find next claimable issue ---
 # claimable = has all of $LABELS, no status:done, no status:blocked, no locked-by:* label
 next_issue() {
-  local l1 l2
+  local l1 l2 json
   l1="$(echo "$LABELS" | cut -d, -f1)"
   l2="$(echo "$LABELS" | cut -d, -f2)"
-  local jq_filter
-  jq_filter='
-      .[]
-      | select((.labels | map(.name) | any(. == "'"$DONE_LABEL"'" or . == "'"$BLOCKED_LABEL"'" or startswith("locked-by:"))) | not)
-      | .number
-    '
   if [ -n "$l2" ] && [ "$l2" != "$l1" ]; then
-    gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --label "$l2" --state open --json number,title,labels --limit 100 | jq -r "$jq_filter" | head -1
+    json="$(gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --label "$l2" --state open --json number,labels --limit 100)"
   else
-    gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --state open --json number,title,labels --limit 100 | jq -r "$jq_filter" | head -1
+    json="$(gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --state open --json number,labels --limit 100)"
   fi
+  # ponytail: first claimable candidate whose project: repo exists locally wins (skips silently otherwise)
+  echo "$json" | jq -r --arg done "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" '
+      .[]
+      | select((.labels | map(.name) | any(. == $done or . == $blocked or startswith("locked-by:"))) | not)
+      | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "")"
+    ' | while read -r num pl; do
+    if repo_available "${pl#project:}"; then echo "$num"; break; fi
+  done
 }
 
 # --- claim issue (label-based, matches claim-task.sh) ---
