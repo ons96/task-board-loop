@@ -13,6 +13,7 @@
 #   ./task-board-loop.sh --once         # do one issue, exit
 #   ./task-board-loop.sh --max N        # stop after N issues
 #   ./task-board-loop.sh --dry-run      # claim+list only, don't actually work
+#   ./task-board-loop.sh --self-test    # unit-test lock/sweep decision logic, exit
 #   ./task-board-loop.sh --label X,Y    # custom label filter (default: status:new)
 #   ./task-board-loop.sh --worker ID    # explicit worker ID (auto-detect otherwise)
 #   ./task-board-loop.sh --worktree-dir DIR  # parent dir for worktrees
@@ -21,8 +22,12 @@
 #   WORKER_ID:     gha-${GITHUB_RUN_ID} | local-${HOSTNAME} | local-$$
 #   LOCK_LABEL:    locked-by:${WORKER_ID}
 #   Claim:         gh issue edit --add-label status:in_progress --add-label locked-by:WORKER_ID --remove-label status:new
-#   Race check:    sleep 2s, re-read labels, confirm our LOCK_LABEL is present
+#   Race check:    pre-read labels (must be status:new + no locked-by:*), edit, sleep 2s, re-read, confirm our LOCK_LABEL
 #   Release:       gh issue edit --remove-label status:in_progress --remove-label locked-by:WORKER_ID --add-label <done|blocked>
+#   Stale TTL:     sweep_stale_locks() frees status:in_progress with no sign of life:
+#                    same-host lock  -> free only if no live pid AND no heartbeat comment within STALE_GRACE
+#                    other-host lock -> free only if neither update nor heartbeat comment within LOCK_TTL (48h)
+#                  always posts a comment when freeing (the comment refreshes updatedAt = anti-flap)
 #   Heartbeat:     comment "heartbeat" every HEARTBEAT_INTERVAL seconds during work
 #                  (watchdog.sh reads last comment containing "heartbeat|Claimed by|Still working")
 #
@@ -37,6 +42,9 @@
 #   OPENCODE_TIMEOUT  max seconds per /work (default: 1800 = 30min)
 #   MAX_RETRIES       per-issue retry count on transient failure (default: 2)
 #   STALE_TIMEOUT     watchdog frees tasks after this many seconds of no heartbeat (default: 600)
+#   LOCK_TTL          sweep frees other-host locks idle this long, seconds (default: 172800 = 48h)
+#   STALE_GRACE       sweep frees same-host locks idle this long, seconds (default: 5400 = 90min)
+#   SWEEP_INTERVAL    min seconds between stale-lock sweeps (default: 1800)
 #   TASK_BOARD_REPO   GitHub repo for issue queue (default: ons96/task-board)
 
 set -euo pipefail
@@ -46,6 +54,7 @@ TASK_BOARD_REPO="${TASK_BOARD_REPO:-ons96/task-board}"
 ONCE=0
 MAX=0
 DRY=0
+SELF_TEST=0
 LABELS="status:new"
 WORKTREE_DIR=""
 while [ $# -gt 0 ]; do
@@ -53,6 +62,7 @@ while [ $# -gt 0 ]; do
     --once) ONCE=1; shift ;;
     --max) MAX="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --self-test) SELF_TEST=1; shift ;;
     --label) LABELS="$2"; shift 2 ;;
     --worker) WORKER_ID="$2"; shift 2 ;;
     --worktree-dir) WORKTREE_DIR="$2"; shift 2 ;;
@@ -83,6 +93,9 @@ OPENCODE_TIMEOUT="${OPENCODE_TIMEOUT:-1800}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-300}"
 STALE_TIMEOUT="${STALE_TIMEOUT:-600}"
+LOCK_TTL="${LOCK_TTL:-172800}"
+STALE_GRACE="${STALE_GRACE:-5400}"
+SWEEP_INTERVAL="${SWEEP_INTERVAL:-1800}"
 # Terminal labels (filter these out + use for completion)
 DONE_LABEL="${DONE_LABEL:-status:done}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-status:blocked}"
@@ -104,6 +117,39 @@ LOCK_LABEL="locked-by:${WORKER_ID}"
 if [[ ! "$LOCK_LABEL" =~ ^[a-zA-Z0-9_:\.\-]{1,50}$ ]]; then
   echo "invalid WORKER_ID -> LOCK_LABEL: $LOCK_LABEL" >&2
   exit 1
+fi
+
+# --- same-host matching for stale-lock sweep (#826) ---
+MY_HOST_LOWER="$(echo "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}" | tr '[:upper:]' '[:lower:]')"
+WORKER_LOWER="$(echo "$WORKER_ID" | tr '[:upper:]' '[:lower:]')"
+LAST_SWEEP=0
+
+# --- decision helpers (pure logic, unit-tested by --self-test) ---
+# stale_by_ttl now last_live ttl -> 0 (stale) if now-last_live >= ttl, else 1
+stale_by_ttl() { [ "$1" -ge "$(( $2 + $3 ))" ]; }
+
+# lock_same_host lock_label -> 0 if the lock belongs to this host (own worker or hostname substring)
+lock_same_host() {
+  local l
+  l="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$l" == "$WORKER_LOWER" ]] && return 0
+  [[ -n "$MY_HOST_LOWER" && "$MY_HOST_LOWER" != "unknown" && "$l" == *"$MY_HOST_LOWER"* ]] && return 0
+  return 1
+}
+
+if [ "$SELF_TEST" = "1" ]; then
+  fails=0
+  check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "ok: $d"; else echo "FAIL: $d"; fails=$((fails+1)); fi; }
+  check_not() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "FAIL: $d"; fails=$((fails+1)); else echo "ok: $d"; fi; }
+  check "own lock is same-host" lock_same_host "$LOCK_LABEL"
+  check "hostname-substring lock is same-host" lock_same_host "locked-by:local-${MY_HOST_LOWER}"
+  check_not "gha lock is other-host" lock_same_host "locked-by:gha-12345"
+  check_not "other hostname is other-host" lock_same_host "locked-by:local-someotherhost99"
+  check "idle past ttl is stale" stale_by_ttl 100 0 50
+  check "idle exactly ttl is stale" stale_by_ttl 100 50 50
+  check_not "idle within ttl is live" stale_by_ttl 100 60 50
+  if [ "$(date -d '2026-09-06T03:24:58Z' +%s 2>/dev/null || echo 0)" -gt 0 ]; then echo "ok: iso date parse"; else echo "FAIL: iso date parse"; fails=$((fails+1)); fi
+  [ "$fails" = "0" ] && { echo "self-test: ALL PASS"; exit 0; } || { echo "self-test: $fails FAILURES"; exit 1; }
 fi
 
 [ -d "$REPO/.git" ] || { echo "warning: launch cwd not a git repo: $REPO (per-issue resolution will be used)" >&2; }
@@ -177,6 +223,14 @@ claim() {
   local n="$1"
   gh label create "$LOCK_LABEL" -R "$TASK_BOARD_REPO" --color "BFD4F2" 2>/dev/null || true
 
+  # ponytail #826: pre-check avoids piling a second lock onto a live claim (flap source)
+  local pre
+  pre="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq '[.labels[].name] | join(" ")' 2>/dev/null || echo "")"
+  if [[ "$pre" == *"locked-by:"* ]] || [[ "$pre" != *"status:new"* ]]; then
+    heartbeat "issue #$n already taken (labels: ${pre:-unreadable}), skipping"
+    return 1
+  fi
+
   if ! gh issue edit "$n" -R "$TASK_BOARD_REPO" \
     --add-label "$IN_PROGRESS_LABEL" \
     --add-label "$LOCK_LABEL" \
@@ -210,6 +264,66 @@ unclaim() {
     --remove-label "$IN_PROGRESS_LABEL" \
     --remove-label "$LOCK_LABEL" \
     --add-label "$label" 2>/dev/null || true
+}
+
+# --- stale-lock TTL sweep (#826) ---
+# Newest liveness epoch for issue $1 = max(updatedAt, newest heartbeat-type comment).
+# ponytail: one API call (updatedAt+comments together); returns 1 on any error (fail-open)
+issue_last_liveness() {
+  local n="$1" raw upd hb ue he
+  raw="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json updatedAt,comments \
+    --jq '{u: .updatedAt, h: ([.comments[] | select(.body // "" | test("heartbeat|Claimed by|Still working"; "i")) | .createdAt] | max // "")}' 2>/dev/null || echo "")"
+  [ -z "$raw" ] && return 1
+  upd="$(echo "$raw" | jq -r .u)"; hb="$(echo "$raw" | jq -r .h)"
+  ue="$(date -d "$upd" +%s 2>/dev/null || echo 0)"; he=0
+  [ -n "$hb" ] && he="$(date -d "$hb" +%s 2>/dev/null || echo 0)"
+  if [ "$he" -gt "$ue" ]; then echo "$he"; else echo "$ue"; fi
+}
+
+# Frees status:in_progress locks with no sign of life (comment posted on every free = anti-flap).
+# DRY=1 logs without mutating. Fail-open: any API error skips the issue, never frees.
+sweep_stale_locks() {
+  local now nums n locks lock same ttl last_live age args l
+  now="$(date +%s)"
+  if [ "$now" -lt "$((LAST_SWEEP + SWEEP_INTERVAL))" ]; then return 0; fi
+  LAST_SWEEP="$now"
+  nums="$(gh issue list -R "$TASK_BOARD_REPO" --label "$IN_PROGRESS_LABEL" --state open --json number --jq '.[].number' 2>/dev/null || echo "")"
+  [ -z "$nums" ] && return 0
+  heartbeat "sweeping stale locks (ttl=${LOCK_TTL}s grace=${STALE_GRACE}s)"
+  for n in $nums; do
+    # ponytail: newline-joined, lock labels may contain spaces
+    locks="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels \
+      --jq '[.labels[].name | select(startswith("locked-by:"))] | join("\n")' 2>/dev/null || echo "")"
+    if [ -z "$locks" ]; then
+      lock="(legacy, no locked-by)"; same=0; ttl="$LOCK_TTL"
+    else
+      lock="$(echo "$locks" | head -1)"
+      [ "$lock" = "$LOCK_LABEL" ] && continue  # ours, never sweep self
+      if lock_same_host "$lock"; then same=1; ttl="$STALE_GRACE"; else same=0; ttl="$LOCK_TTL"; fi
+    fi
+    if [ "$same" = "1" ]; then
+      local pidf="/tmp/opencode-work-${n}.pid" pid
+      pid="$(cat "$pidf" 2>/dev/null || echo "")"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        heartbeat "#$n same-host lock $lock has live pid $pid, keeping"
+        continue
+      fi
+    fi
+    last_live="$(issue_last_liveness "$n" || echo "")"
+    [ -z "$last_live" ] && { heartbeat "#$n liveness unreadable, skipping (fail-open)"; continue; }
+    age="$((now - last_live))"
+    if stale_by_ttl "$now" "$last_live" "$ttl"; then
+      if [ "$DRY" = "1" ]; then
+        heartbeat "dry-run: would auto-release #$n (lock $lock, idle ${age}s > ttl ${ttl}s)"
+        continue
+      fi
+      comment "$n" "task-board-loop: auto-release, lock \`${lock}\` idle ${age}s with no heartbeat (ttl ${ttl}s). Returning to open queue."
+      args=(--remove-label "$IN_PROGRESS_LABEL" --add-label "status:new")
+      while IFS= read -r l; do [ -n "$l" ] && args+=(--remove-label "$l"); done <<< "$locks"
+      gh issue edit "$n" -R "$TASK_BOARD_REPO" "${args[@]}" 2>/dev/null || true
+      heartbeat "auto-released #$n (was $lock)"
+    fi
+  done
 }
 
 # --- cleanup worktree safely (never force-removes with changes) ---
@@ -388,9 +502,11 @@ EOF
 # --- main loop ---
 heartbeat "starting (once=$ONCE max=$MAX dry=$DRY)"
 trap 'heartbeat "interrupted, summary: done=$DONE skipped=$SKIPPED blocked=$BLOCKED failed=$FAILED"; exit 130' INT TERM
+sweep_stale_locks || true  # startup reclaim before first claim
 
 while :; do
   heartbeat
+  sweep_stale_locks || true  # throttled by SWEEP_INTERVAL
   N="$(next_issue || true)"
   if [ -z "$N" ]; then
     heartbeat "no claimable issues, sleeping ${IDLE_SLEEP}s"
