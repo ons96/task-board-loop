@@ -41,6 +41,10 @@
 #   IDLE_SLEEP        seconds to wait when no work (default: 60)
 #   OPENCODE_TIMEOUT  max seconds per /work (default: 1800 = 30min)
 #   MAX_RETRIES       per-issue retry count on transient failure (default: 2)
+#   OPENCODE_MODEL_CHAIN comma-separated opencode model ids; retry advances to next (default below)
+#   OPENCODE_MODEL    if set, prepended to the chain as first choice
+#   MIN_LOG_BYTES     verify gate: /work log smaller than this = failure (default: 200)
+#   VPS_GATEWAY_URL   gateway base URL for model probes (default: http://100.71.95.75:8000)
 #   STALE_TIMEOUT     watchdog frees tasks after this many seconds of no heartbeat (default: 600)
 #   LOCK_TTL          sweep frees other-host locks idle this long, seconds (default: 172800 = 48h)
 #   STALE_GRACE       sweep frees same-host locks idle this long, seconds (default: 5400 = 90min)
@@ -101,6 +105,22 @@ DONE_LABEL="${DONE_LABEL:-status:done}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-status:blocked}"
 IN_PROGRESS_LABEL="${IN_PROGRESS_LABEL:-status:in_progress}"
 
+# --- model chain (#841 follow-up): dead-model resilience ---
+# Comma-separated; retry N uses chain position (round-robin). vps-gateway/* virtual models
+# have gateway-internal fallback chains AND are curl-probed pre-flight; dead ones are skipped.
+#nous/stealth/ox-alpha REMOVED 2026-09-08: model no longer exists upstream (40s empty runs rubber-stamped as done, see #841).
+DEFAULT_MODEL_CHAIN="vps-gateway/coding-fast,vps-gateway/coding-smart,opencode/deepseek-v4-flash-free"
+MODEL_CHAIN="${OPENCODE_MODEL_CHAIN:-}"
+[ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:+$OPENCODE_MODEL,}$DEFAULT_MODEL_CHAIN"
+IFS=',' read -r -a MODELS <<< "$MODEL_CHAIN"
+VPS_GATEWAY_URL="${VPS_GATEWAY_URL:-http://100.71.95.75:8000}"
+MIN_LOG_BYTES="${MIN_LOG_BYTES:-200}"
+# ponytail: targeted key extraction instead of sourcing ~/.env (stray-line exec gotcha)
+if [ -z "${VPS_GATEWAY_API_KEY:-}" ] && [ -f "$HOME/.env" ]; then
+  VPS_GATEWAY_API_KEY="$(grep -E '^VPS_GATEWAY_API_KEY=' "$HOME/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'"' || true)"
+  export VPS_GATEWAY_API_KEY
+fi
+
 # --- canonical WORKER_ID (matches claim-task.sh) ---
 if [[ -z "${WORKER_ID:-}" ]]; then
   if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
@@ -147,6 +167,43 @@ lock_same_host() {
   return 1
 }
 
+# --- model selection + verification (#841) ---
+# pick_model RETRY -> model for this attempt (round-robin over MODELS array)
+pick_model() {
+  local i=$(( $1 % ${#MODELS[@]} ))
+  echo "${MODELS[$i]}"
+}
+
+# probe_gateway_model MODEL -> 0 if gateway virtual model answers a 1-token ping
+# ponytail: probe only vps-gateway/* (their chains route whole provider pools);
+# non-gateway models rely on the verify gate instead of pre-flight probing.
+probe_gateway_model() {
+  local model="$1" sub="${model#vps-gateway/}"
+  [ "$sub" = "$model" ] && return 0   # not a gateway model, nothing to probe
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+    -H "Authorization: Bearer ${VPS_GATEWAY_API_KEY:-}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+    "$VPS_GATEWAY_URL/v1/chat/completions" 2>/dev/null) || return 1
+  [ "$code" = "200" ]
+}
+
+# verify_work LOG WT BRANCH -> 0 only if the run produced real work.
+# Gate: log at least MIN_LOG_BYTES (bogus runs were 33-byte banner-only) AND
+# (dirty worktree OR commits ahead of main).
+verify_work() {
+  local log="$1" wt="$2" branch="$3"
+  [ -f "$log" ] || return 1
+  [ "$(wc -c < "$log")" -ge "$MIN_LOG_BYTES" ] || return 1
+  git -C "$wt" rev-parse --verify "$branch" >/dev/null 2>&1 || return 1
+  if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    return 0
+  fi
+  git -C "$wt" fetch origin "$MAIN_BRANCH" >/dev/null 2>&1 || true
+  [ "$(git -C "$wt" rev-list --count "origin/$MAIN_BRANCH..$branch" 2>/dev/null || echo 0)" -gt 0 ]
+}
+
 if [ "$SELF_TEST" = "1" ]; then
   fails=0
   check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "ok: $d"; else echo "FAIL: $d"; fails=$((fails+1)); fi; }
@@ -163,6 +220,33 @@ if [ "$SELF_TEST" = "1" ]; then
   check "idle past ttl is stale" stale_by_ttl 100 0 50
   check "idle exactly ttl is stale" stale_by_ttl 100 50 50
   check_not "idle within ttl is live" stale_by_ttl 100 60 50
+  # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
+  # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
+  MIN_LOG_BYTES=200
+  MAIN_BRANCH=main
+  vdir="$(mktemp -d /tmp/vwtest.XXXXXX)"
+  git init -q --bare "$vdir/origin.git" || { echo "FAIL: vwtest git init"; fails=$((fails+1)); }
+  if git clone -q "$vdir/origin.git" "$vdir/wt" 2>/dev/null && \
+     git -C "$vdir/wt" config user.email t@t && git -C "$vdir/wt" config user.name t && \
+     ( echo seed > "$vdir/wt/seed" && git -C "$vdir/wt" add -A && git -C "$vdir/wt" commit -qm seed ) && \
+     git -C "$vdir/wt" push -q origin HEAD:main 2>/dev/null && \
+     git -C "$vdir/wt" checkout -qb work/1 2>/dev/null; then
+  vlog="$vdir/run.log"
+  printf '%200s' '' > "$vlog"   # 200 bytes of padding
+  check_not "verify fails: big log but clean tree, no commits" verify_work "$vlog" "$vdir/wt" work/1
+  echo change > "$vdir/wt/seed"     # dirty worktree
+  check "verify passes: dirty worktree" verify_work "$vlog" "$vdir/wt" work/1
+  git -C "$vdir/wt" commit -qam work   # commit the dirty change -> clean tree, ahead of origin/main
+  check "verify passes: commit ahead of origin/main" verify_work "$vlog" "$vdir/wt" work/1
+  printf 'banner only' > "$vlog"   # 11 bytes < MIN_LOG_BYTES
+  echo change2 > "$vdir/wt/seed"
+  check_not "verify fails: dirty tree but tiny log" verify_work "$vlog" "$vdir/wt" work/1
+  rm -rf "$vdir"
+  else
+    echo "FAIL: vwtest repo setup"; fails=$((fails+1)); rm -rf "$vdir"
+  fi
+  [ "$(pick_model 0)" = "${MODELS[0]}" ] && echo "ok: pick_model 0" || { echo "FAIL: pick_model 0"; fails=$((fails+1)); }
+  [ "$(pick_model ${#MODELS[@]})" = "${MODELS[0]}" ] && echo "ok: pick_model wraps" || { echo "FAIL: pick_model wraps"; fails=$((fails+1)); }
   if [ "$(date -d '2026-09-06T03:24:58Z' +%s 2>/dev/null || echo 0)" -gt 0 ]; then echo "ok: iso date parse"; else echo "FAIL: iso date parse"; fails=$((fails+1)); fi
   [ "$fails" = "0" ] && { echo "self-test: ALL PASS"; exit 0; } || { echo "self-test: $fails FAILURES"; exit 1; }
 fi
@@ -457,11 +541,13 @@ do_issue() {
   fi
 
   # run opencode with /work prompt, retry up to MAX_RETRIES times
+  local model logf="$LOG_DIR/issue-$n.log"
   start_heartbeat_poster "$n"
   while [ "$retry" -le "$MAX_RETRIES" ]; do
-    heartbeat "running /work $n (attempt $((retry+1)))"
+    model="$(pick_model "$retry")"
+    heartbeat "running /work $n (attempt $((retry+1)), model=$model)"
     if [ "$DRY" = "1" ]; then
-      heartbeat "dry-run: would run: cd $wt && $OPENCODE_BIN run < /work prompt"
+      heartbeat "dry-run: would run: cd $wt && $OPENCODE_BIN run -m $model < /work prompt"
       result=0
     else
       cd "$wt"
@@ -479,10 +565,24 @@ Body:
 $(echo "$issue_meta" | jq -r .b)
 EOF
 )
-      set +e
-      timeout "$OPENCODE_TIMEOUT" "$OPENCODE_BIN" run -m "${OPENCODE_MODEL:-nous/stealth/ox-alpha}" "$prompt" 2>&1 | tee "$LOG_DIR/issue-$n.log"
-      result=${PIPESTATUS[0]}
-      set -e
+      if ! probe_gateway_model "$model"; then
+        heartbeat "model $model dead (gateway probe fail), skipping to next"
+        result=1
+      else
+        set +e
+        timeout "$OPENCODE_TIMEOUT" "$OPENCODE_BIN" run -m "$model" "$prompt" 2>&1 | tee "$logf"
+        result=${PIPESTATUS[0]}
+        set -e
+      fi
+    fi
+    # verify-before-done gate (#841): exit-0 alone is NOT success
+    if [ "$result" = "0" ] && [ "$DRY" != "1" ]; then
+      if verify_work "$logf" "$wt" "$branch"; then
+        heartbeat "verify OK for #$n (log $(wc -c < "$logf") bytes, real work present)"
+      else
+        heartbeat "verify FAILED for #$n (exit-0 but no work product) — downgrading"
+        result=1
+      fi
     fi
     if [ "$result" = "0" ]; then
       if [ "$DRY" = "1" ]; then
@@ -497,7 +597,7 @@ EOF
         DONE=$((DONE+1))
         return 0
       fi
-      comment "$n" "task-board-loop: completed on attempt $((retry+1))"
+      comment "$n" "task-board-loop: completed on attempt $((retry+1)) (model=$model, verified: log $(wc -c < "$logf")B + worktree diff)"
       unclaim "$n" "$DONE_LABEL"
       cleanup_worktree "$wt"
       stop_heartbeat_poster "$n"
@@ -513,7 +613,12 @@ EOF
   done
 
   # all retries exhausted
-  comment "$n" "task-board-loop: failed after $((MAX_RETRIES+1)) attempts. Log: \`$LOG_DIR/issue-$n.log\`. Needs investigation."
+  local log_tail=""
+  if [ -f "$logf" ]; then
+    log_tail="$(tail -c 2000 "$logf" | tail -5 | sed 's/`/'"'"'/g')"
+  fi
+  comment "$n" "task-board-loop: failed after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Needs investigation. Last log lines:
+$log_tail"
   unclaim "$n" "$BLOCKED_LABEL"
   cleanup_worktree "$wt"
   stop_heartbeat_poster "$n"
