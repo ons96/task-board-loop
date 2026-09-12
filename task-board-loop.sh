@@ -109,7 +109,7 @@ IN_PROGRESS_LABEL="${IN_PROGRESS_LABEL:-status:in_progress}"
 # Comma-separated; retry N uses chain position (round-robin). vps-gateway/* virtual models
 # have gateway-internal fallback chains AND are curl-probed pre-flight; dead ones are skipped.
 #nous/stealth/ox-alpha REMOVED 2026-09-08: model no longer exists upstream (40s empty runs rubber-stamped as done, see #841).
-DEFAULT_MODEL_CHAIN="vps-gateway/coding-fast,vps-gateway/coding-smart,opencode/deepseek-v4-flash-free"
+DEFAULT_MODEL_CHAIN="septorlabs/deepseek-v4-pro,crowllm/gpt-5.6-sol,crowllm/glm-5.3,crowllm/kimi-k3,vps-gateway/coding-elite,vps-gateway/coding-smart"
 MODEL_CHAIN="${OPENCODE_MODEL_CHAIN:-}"
 [ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:+$OPENCODE_MODEL,}$DEFAULT_MODEL_CHAIN"
 IFS=',' read -r -a MODELS <<< "$MODEL_CHAIN"
@@ -198,8 +198,11 @@ verify_work() {
   [ "$(wc -c < "$log")" -ge "$MIN_LOG_BYTES" ] || return 1
   git -C "$wt" rev-parse --verify "$branch" >/dev/null 2>&1 || return 1
   if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    # ponytail: test gate, fail if tests exist and break
+    if [ -f "$wt/package.json" ]; then (cd "$wt" && npm test -- --silent) || return 1; elif [ -f "$wt/pyproject.toml" ]; then (cd "$wt" && pytest -q) || return 1; fi
     return 0
   fi
+  if [ -f "$wt/package.json" ]; then (cd "$wt" && npm test -- --silent) || return 1; elif [ -f "$wt/pyproject.toml" ]; then (cd "$wt" && pytest -q) || return 1; fi
   git -C "$wt" fetch origin "$MAIN_BRANCH" >/dev/null 2>&1 || true
   [ "$(git -C "$wt" rev-list --count "origin/$MAIN_BRANCH..$branch" 2>/dev/null || echo 0)" -gt 0 ]
 }
