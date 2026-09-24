@@ -103,6 +103,8 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - All actions logged to `/tmp/agent-loop-issue-N.log` + journal
 - Non-interactive OpenCode runs prefer `~/.config/opencode/scripts/opencode-resilient.sh`, which retries only classified transient network/provider/transport failures and logs to `~/.local/state/opencode/resilience/`
 - Issues with missing/blocked deps auto-skipped (see opencode `/work` Phase 0)
+- Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
+- Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored. Use only recently verified models; the built-in list remains the fallback.
 
 ## Resilience wrapper
 
@@ -121,9 +123,9 @@ On RAM-tight headless hosts (e.g. 1GB VPS-155), the interactive OpenCode
 config loads global plugins/MCPs that push startup past the loop's short
 timeout. The bundled `opencode-headless.sh` wrapper sidesteps this:
 
-- Sources and exports `~/.env` (so `{env:VPS_GATEWAY_API_KEY}` resolves)
+- Sources and exports `~/.env` (so `{env:GATEWAY_API_KEY}` resolves)
 - Runs `opencode --pure "$@"` (skips external plugins + MCPs, ~25s boot)
-- Validates the binary exists and `VPS_GATEWAY_API_KEY` is nonempty
+- Validates the binary exists and `GATEWAY_API_KEY` is nonempty
 - Self-check: `./opencode-headless.sh --self-check` prints `opencode-headless: OK`
 - `OPENCODE_BIN=/path/to/real/opencode` overrides and bypasses the wrapper
 
