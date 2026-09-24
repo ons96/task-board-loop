@@ -107,6 +107,25 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
 - Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored. Use only recently verified models; the built-in list remains the fallback.
 
+## Session-close reconciliation
+
+Use `scripts/session-close-reconcile.py` only for the explicitly named current
+OpenCode session. It defaults to dry-run and never selects sessions by age.
+
+```bash
+scripts/session-close-reconcile.py \
+  --session-id ses_... --issue 900 --outcome done --ref 0123abc
+scripts/session-close-reconcile.py \
+  --session-id ses_... --issue 900 --outcome blocked \
+  --reason 'needs supervised VPS validation'
+scripts/session-close-reconcile.py --self-test
+```
+
+Add `--apply` only after reviewing the dry-run. A `done` close marks only that
+session's pending/in-progress rows completed, requires a commit/PR reference,
+and creates a database backup first. `blocked` and `deferred` preserve rows and
+append evidence to `~/.local/share/opencode/session-reconciliations.log`.
+
 ## Resilience wrapper
 
 Set `OPENCODE_BIN=opencode` to bypass the wrapper, or `OPENCODE_RESILIENCE_DISABLE=1` to keep the wrapper path but disable retry logic. The wrapper retries recoverable failures such as connection resets, timeouts, 429/5xx, gateway/tunnel drops, streaming aborts, and MCP transport resets. It does not retry auth/config/tool misuse failures such as 401/403, bad credentials, invalid config, syntax errors, missing files, or provider mapping errors.
