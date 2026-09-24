@@ -44,6 +44,9 @@
 #   OPENCODE_MODEL_CHAIN comma-separated opencode model ids; retry advances to next (default below)
 #   OPENCODE_MODEL    if set, prepended to the chain as first choice
 #   MIN_LOG_BYTES     verify gate: /work log smaller than this = failure (default: 200)
+#   OPENCODE_NICE     CPU niceness for active runs (default: 10)
+#   OPENCODE_IONICE   I/O priority class for active runs (default: 3/idle)
+#   OPENCODE_MEMORY_MAX_MB optional systemd user-scope memory cap
 #   VPS_GATEWAY_URL   gateway base URL for model probes (default: http://100.71.95.75:8000)
 #   STALE_TIMEOUT     watchdog frees tasks after this many seconds of no heartbeat (default: 600)
 #   LOCK_TTL          sweep frees other-host locks idle this long, seconds (default: 172800 = 48h)
@@ -109,16 +112,21 @@ IN_PROGRESS_LABEL="${IN_PROGRESS_LABEL:-status:in_progress}"
 # Comma-separated; retry N uses chain position (round-robin). vps-gateway/* virtual models
 # have gateway-internal fallback chains AND are curl-probed pre-flight; dead ones are skipped.
 #nous/stealth/ox-alpha REMOVED 2026-09-08: model no longer exists upstream (40s empty runs rubber-stamped as done, see #841).
-DEFAULT_MODEL_CHAIN="septorlabs/deepseek-v4-pro,crowllm/gpt-5.6-sol,crowllm/glm-5.3,crowllm/kimi-k3,vps-gateway/coding-elite,vps-gateway/coding-smart"
+DEFAULT_MODEL_CHAIN="crowllm/gpt-5.6-sol,crowllm/glm-5.3,crowllm/kimi-k3,vps-gateway/coding-elite,vps-gateway/coding-smart"
 MODEL_CHAIN="${OPENCODE_MODEL_CHAIN:-}"
+[ -z "$MODEL_CHAIN" ] && [ -r "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" ] && \
+  MODEL_CHAIN="$(grep -Ev '^[[:space:]]*(#|$)' "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" | paste -sd, -)"
 [ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:+$OPENCODE_MODEL,}$DEFAULT_MODEL_CHAIN"
 IFS=',' read -r -a MODELS <<< "$MODEL_CHAIN"
 VPS_GATEWAY_URL="${VPS_GATEWAY_URL:-http://100.71.95.75:8000}"
 MIN_LOG_BYTES="${MIN_LOG_BYTES:-200}"
+OPENCODE_NICE="${OPENCODE_NICE:-10}"
+OPENCODE_IONICE="${OPENCODE_IONICE:-3}"
+OPENCODE_MEMORY_MAX_MB="${OPENCODE_MEMORY_MAX_MB:-}"
 # ponytail: targeted key extraction instead of sourcing ~/.env (stray-line exec gotcha)
-if [ -z "${VPS_GATEWAY_API_KEY:-}" ] && [ -f "$HOME/.env" ]; then
-  VPS_GATEWAY_API_KEY="$(grep -E '^VPS_GATEWAY_API_KEY=' "$HOME/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'"' || true)"
-  export VPS_GATEWAY_API_KEY
+if [ -z "${GATEWAY_API_KEY:-}" ] && [ -f "$HOME/.env" ]; then
+  GATEWAY_API_KEY="$(grep -E '^GATEWAY_API_KEY=' "$HOME/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'"' || true)"
+  export GATEWAY_API_KEY
 fi
 
 # --- canonical WORKER_ID (matches claim-task.sh) ---
@@ -174,6 +182,20 @@ pick_model() {
   echo "${MODELS[$i]}"
 }
 
+run_opencode() {
+  local model="$1" prompt="$2"
+  local -a cmd=(timeout "$OPENCODE_TIMEOUT" nice -n "$OPENCODE_NICE")
+  if command -v ionice >/dev/null 2>&1; then
+    cmd+=(ionice -c "$OPENCODE_IONICE")
+  fi
+  cmd+=("$OPENCODE_BIN" run -m "$model" "$prompt")
+  if [ -n "$OPENCODE_MEMORY_MAX_MB" ] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user --scope --quiet -p "MemoryMax=${OPENCODE_MEMORY_MAX_MB}M" -- "${cmd[@]}"
+  else
+    "${cmd[@]}"
+  fi
+}
+
 # probe_gateway_model MODEL -> 0 if gateway virtual model answers a 1-token ping
 # ponytail: probe only vps-gateway/* (their chains route whole provider pools);
 # non-gateway models rely on the verify gate instead of pre-flight probing.
@@ -182,7 +204,7 @@ probe_gateway_model() {
   [ "$sub" = "$model" ] && return 0   # not a gateway model, nothing to probe
   local code
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
-    -H "Authorization: Bearer ${VPS_GATEWAY_API_KEY:-}" \
+    -H "Authorization: Bearer ${GATEWAY_API_KEY:-}" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
     "$VPS_GATEWAY_URL/v1/chat/completions" 2>/dev/null) || return 1
@@ -545,6 +567,7 @@ do_issue() {
 
   # run opencode with /work prompt, retry up to MAX_RETRIES times
   local model logf="$LOG_DIR/issue-$n.log"
+  : > "$logf"
   start_heartbeat_poster "$n"
   while [ "$retry" -le "$MAX_RETRIES" ]; do
     model="$(pick_model "$retry")"
@@ -573,7 +596,7 @@ EOF
         result=1
       else
         set +e
-        timeout "$OPENCODE_TIMEOUT" "$OPENCODE_BIN" run -m "$model" "$prompt" 2>&1 | tee "$logf"
+        run_opencode "$model" "$prompt" 2>&1 | tee -a "$logf"
         result=${PIPESTATUS[0]}
         set -e
       fi

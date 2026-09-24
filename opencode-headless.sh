@@ -18,8 +18,8 @@ set -a
 . "$ENV_FILE"
 set +a
 
-[ -n "${VPS_GATEWAY_API_KEY:-}" ] || {
-  echo "opencode-headless: VPS_GATEWAY_API_KEY is not set" >&2
+[ -n "${GATEWAY_API_KEY:-}" ] || {
+  echo "opencode-headless: GATEWAY_API_KEY is not set" >&2
   exit 1
 }
 
