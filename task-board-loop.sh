@@ -88,16 +88,31 @@ if [ "$SIMULATE" = "1" ]; then
   sim_probe_tokens="${PROBE_MAX_TOKENS:-15}"
   sim_min_log="${MIN_LOG_BYTES:-200}"
   IFS=',' read -r -a sim_models <<< "$sim_chain"
+  # ponytail: force N failed attempts to exercise fallback without network.
+  sim_fail_first="${SIMULATE_FAIL_FIRST:-0}"
+  case "$sim_fail_first" in
+    ''|*[!0-9]*) echo "simulation: SIMULATE_FAIL_FIRST must be a non-negative integer (got '$sim_fail_first')" >&2; exit 2 ;;
+  esac
+  if [ "$sim_fail_first" -ge "${#sim_models[@]}" ]; then
+    echo "simulation: SIMULATE_FAIL_FIRST=$sim_fail_first >= chain length ${#sim_models[@]}" >&2; exit 2
+  fi
   sim_selected="101"
-  sim_payload="{\"model\":\"${sim_models[0]}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$sim_probe_tokens}"
+  sim_attempt0="${sim_models[0]}"
+  sim_next_model="${sim_models[$sim_fail_first]}"
+  sim_payload="{\"model\":\"$sim_attempt0\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$sim_probe_tokens}"
   sim_log="$(mktemp)"
   printf '%*s' "$sim_min_log" '' > "$sim_log"
   sim_log_size="$(wc -c < "$sim_log")"
   rm -f "$sim_log"
   [ "$sim_selected" = "101" ] || { echo "simulation: FAIL issue selection" >&2; exit 1; }
   [ "$sim_log_size" -ge "$sim_min_log" ] || { echo "simulation: FAIL verify gate" >&2; exit 1; }
-  printf 'simulation: PASS\nissue_selected: #%s\nmodel_selected: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
-    "$sim_selected" "${sim_models[0]}" "$sim_payload" "$sim_log_size"
+  if [ "$sim_fail_first" -gt 0 ]; then
+    printf 'simulation: PASS\nissue_selected: #%s\nfailed_attempts: %s (forced dead)\nfallback_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_next_model" "$sim_payload" "$sim_log_size"
+  else
+    printf 'simulation: PASS\nissue_selected: #%s\nattempt_0_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_payload" "$sim_log_size"
+  fi
   exit 0
 fi
 

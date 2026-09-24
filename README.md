@@ -107,6 +107,7 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Issues with missing/blocked deps auto-skipped (see opencode `/work` Phase 0)
 - By default, claims pause while the current user has an `opencode` or `omp` process; set `PAUSE_ON_HUMAN=0` only for unattended workers.
 - `--simulate` is safe for local validation: it exercises issue/model selection, the probe payload, and the verification threshold with mocks; it exits before `gh`, `curl`, OpenCode, git, or network setup.
+- Set `SIMULATE_FAIL_FIRST=N` with `--simulate` to force a dead first attempt and verify fallback selection; invalid values fail without external calls.
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
 - Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored. Use only recently verified models; the built-in list remains the fallback.
 
