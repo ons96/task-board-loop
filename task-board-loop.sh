@@ -122,6 +122,7 @@ fi
 [ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:+$OPENCODE_MODEL,}$DEFAULT_MODEL_CHAIN"
 IFS=',' read -r -a MODELS <<< "$MODEL_CHAIN"
 VPS_GATEWAY_URL="${VPS_GATEWAY_URL:-http://100.71.95.75:8000}"
+PROBE_MAX_TOKENS="${PROBE_MAX_TOKENS:-15}"
 MIN_LOG_BYTES="${MIN_LOG_BYTES:-200}"
 OPENCODE_NICE="${OPENCODE_NICE:-10}"
 OPENCODE_IONICE="${OPENCODE_IONICE:-3}"
@@ -206,7 +207,7 @@ human_active() {
     pgrep -u "$(id -u)" -x omp >/dev/null 2>&1
 }
 
-# probe_gateway_model MODEL -> 0 if gateway virtual model answers a 1-token ping
+# probe_gateway_model MODEL -> 0 if gateway virtual model answers a short ping
 # ponytail: probe only vps-gateway/* (their chains route whole provider pools);
 # non-gateway models rely on the verify gate instead of pre-flight probing.
 probe_gateway_model() {
@@ -216,7 +217,7 @@ probe_gateway_model() {
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
     -H "Authorization: Bearer ${GATEWAY_API_KEY:-}" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+    -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$PROBE_MAX_TOKENS}" \
     "$VPS_GATEWAY_URL/v1/chat/completions" 2>/dev/null) || return 1
   [ "$code" = "200" ]
 }
