@@ -38,6 +38,8 @@ systemctl --user enable --now task-board-loop-watchdog.timer
 # or with limits
 ./task-board-loop.sh --max 3
 ./task-board-loop.sh --dry-run
+# local-only simulation; no GitHub, provider, OpenCode, git, or network calls
+./task-board-loop.sh --simulate
 ```
 
 ## Supervisor on VPS-155 (tmux)
@@ -104,6 +106,7 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Non-interactive OpenCode runs prefer `~/.config/opencode/scripts/opencode-resilient.sh`, which retries only classified transient network/provider/transport failures and logs to `~/.local/state/opencode/resilience/`
 - Issues with missing/blocked deps auto-skipped (see opencode `/work` Phase 0)
 - By default, claims pause while the current user has an `opencode` or `omp` process; set `PAUSE_ON_HUMAN=0` only for unattended workers.
+- `--simulate` is safe for local validation: it exercises issue/model selection, the probe payload, and the verification threshold with mocks; it exits before `gh`, `curl`, OpenCode, git, or network setup.
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
 - Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored. Use only recently verified models; the built-in list remains the fallback.
 

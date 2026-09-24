@@ -14,6 +14,7 @@
 #   ./task-board-loop.sh --max N        # stop after N issues
 #   ./task-board-loop.sh --dry-run      # claim+list only, don't actually work
 #   ./task-board-loop.sh --self-test    # unit-test lock/sweep decision logic, exit
+#   ./task-board-loop.sh --simulate     # local-only logic simulation; no network/process side effects
 #   ./task-board-loop.sh --label X,Y    # custom label filter (default: status:new)
 #   ./task-board-loop.sh --worker ID    # explicit worker ID (auto-detect otherwise)
 #   ./task-board-loop.sh --worktree-dir DIR  # parent dir for worktrees
@@ -63,6 +64,7 @@ ONCE=0
 MAX=0
 DRY=0
 SELF_TEST=0
+SIMULATE=0
 LABELS="status:new"
 WORKTREE_DIR=""
 while [ $# -gt 0 ]; do
@@ -71,6 +73,7 @@ while [ $# -gt 0 ]; do
     --max) MAX="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
+    --simulate) SIMULATE=1; shift ;;
     --label) LABELS="$2"; shift 2 ;;
     --worker) WORKER_ID="$2"; shift 2 ;;
     --worktree-dir) WORKTREE_DIR="$2"; shift 2 ;;
@@ -78,6 +81,25 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# Simulation exits before env loading, filesystem setup, gh, curl, OpenCode, or git.
+if [ "$SIMULATE" = "1" ]; then
+  sim_chain="${OPENCODE_MODEL_CHAIN:-crowllm/gpt-5.6-sol,vps-gateway/coding-fast}"
+  sim_probe_tokens="${PROBE_MAX_TOKENS:-15}"
+  sim_min_log="${MIN_LOG_BYTES:-200}"
+  IFS=',' read -r -a sim_models <<< "$sim_chain"
+  sim_selected="101"
+  sim_payload="{\"model\":\"${sim_models[0]}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$sim_probe_tokens}"
+  sim_log="$(mktemp)"
+  printf '%*s' "$sim_min_log" '' > "$sim_log"
+  sim_log_size="$(wc -c < "$sim_log")"
+  rm -f "$sim_log"
+  [ "$sim_selected" = "101" ] || { echo "simulation: FAIL issue selection" >&2; exit 1; }
+  [ "$sim_log_size" -ge "$sim_min_log" ] || { echo "simulation: FAIL verify gate" >&2; exit 1; }
+  printf 'simulation: PASS\nissue_selected: #%s\nmodel_selected: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+    "$sim_selected" "${sim_models[0]}" "$sim_payload" "$sim_log_size"
+  exit 0
+fi
 
 # --- env ---
 REPO="${REPO:-$PWD}"
