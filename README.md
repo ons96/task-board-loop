@@ -104,7 +104,7 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Non-interactive OpenCode runs prefer `~/.config/opencode/scripts/opencode-resilient.sh`, which retries only classified transient network/provider/transport failures and logs to `~/.local/state/opencode/resilience/`
 - Issues with missing/blocked deps auto-skipped (see opencode `/work` Phase 0)
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
-- Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored.
+- Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored. Use only recently verified models; the built-in list remains the fallback.
 
 ## Resilience wrapper
 
