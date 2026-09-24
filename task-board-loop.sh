@@ -14,6 +14,7 @@
 #   ./task-board-loop.sh --max N        # stop after N issues
 #   ./task-board-loop.sh --dry-run      # claim+list only, don't actually work
 #   ./task-board-loop.sh --self-test    # unit-test lock/sweep decision logic, exit
+#   ./task-board-loop.sh --simulate     # local-only logic simulation; no network/process side effects
 #   ./task-board-loop.sh --label X,Y    # custom label filter (default: status:new)
 #   ./task-board-loop.sh --worker ID    # explicit worker ID (auto-detect otherwise)
 #   ./task-board-loop.sh --worktree-dir DIR  # parent dir for worktrees
@@ -63,6 +64,7 @@ ONCE=0
 MAX=0
 DRY=0
 SELF_TEST=0
+SIMULATE=0
 LABELS="status:new"
 WORKTREE_DIR=""
 while [ $# -gt 0 ]; do
@@ -71,6 +73,7 @@ while [ $# -gt 0 ]; do
     --max) MAX="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
+    --simulate) SIMULATE=1; shift ;;
     --label) LABELS="$2"; shift 2 ;;
     --worker) WORKER_ID="$2"; shift 2 ;;
     --worktree-dir) WORKTREE_DIR="$2"; shift 2 ;;
@@ -78,6 +81,40 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# Simulation exits before env loading, filesystem setup, gh, curl, OpenCode, or git.
+if [ "$SIMULATE" = "1" ]; then
+  sim_chain="${OPENCODE_MODEL_CHAIN:-crowllm/gpt-5.6-sol,vps-gateway/coding-fast}"
+  sim_probe_tokens="${PROBE_MAX_TOKENS:-15}"
+  sim_min_log="${MIN_LOG_BYTES:-200}"
+  IFS=',' read -r -a sim_models <<< "$sim_chain"
+  # ponytail: force N failed attempts to exercise fallback without network.
+  sim_fail_first="${SIMULATE_FAIL_FIRST:-0}"
+  case "$sim_fail_first" in
+    ''|*[!0-9]*) echo "simulation: SIMULATE_FAIL_FIRST must be a non-negative integer (got '$sim_fail_first')" >&2; exit 2 ;;
+  esac
+  if [ "$sim_fail_first" -ge "${#sim_models[@]}" ]; then
+    echo "simulation: SIMULATE_FAIL_FIRST=$sim_fail_first >= chain length ${#sim_models[@]}" >&2; exit 2
+  fi
+  sim_selected="101"
+  sim_attempt0="${sim_models[0]}"
+  sim_next_model="${sim_models[$sim_fail_first]}"
+  sim_payload="{\"model\":\"$sim_attempt0\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$sim_probe_tokens}"
+  sim_log="$(mktemp)"
+  printf '%*s' "$sim_min_log" '' > "$sim_log"
+  sim_log_size="$(wc -c < "$sim_log")"
+  rm -f "$sim_log"
+  [ "$sim_selected" = "101" ] || { echo "simulation: FAIL issue selection" >&2; exit 1; }
+  [ "$sim_log_size" -ge "$sim_min_log" ] || { echo "simulation: FAIL verify gate" >&2; exit 1; }
+  if [ "$sim_fail_first" -gt 0 ]; then
+    printf 'simulation: PASS\nissue_selected: #%s\nfailed_attempts: %s (forced dead)\nfallback_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_next_model" "$sim_payload" "$sim_log_size"
+  else
+    printf 'simulation: PASS\nissue_selected: #%s\nattempt_0_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_payload" "$sim_log_size"
+  fi
+  exit 0
+fi
 
 # --- env ---
 REPO="${REPO:-$PWD}"
@@ -122,6 +159,7 @@ fi
 [ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:+$OPENCODE_MODEL,}$DEFAULT_MODEL_CHAIN"
 IFS=',' read -r -a MODELS <<< "$MODEL_CHAIN"
 VPS_GATEWAY_URL="${VPS_GATEWAY_URL:-http://100.71.95.75:8000}"
+PROBE_MAX_TOKENS="${PROBE_MAX_TOKENS:-15}"
 MIN_LOG_BYTES="${MIN_LOG_BYTES:-200}"
 OPENCODE_NICE="${OPENCODE_NICE:-10}"
 OPENCODE_IONICE="${OPENCODE_IONICE:-3}"
@@ -206,7 +244,7 @@ human_active() {
     pgrep -u "$(id -u)" -x omp >/dev/null 2>&1
 }
 
-# probe_gateway_model MODEL -> 0 if gateway virtual model answers a 1-token ping
+# probe_gateway_model MODEL -> 0 if gateway virtual model answers a short ping
 # ponytail: probe only vps-gateway/* (their chains route whole provider pools);
 # non-gateway models rely on the verify gate instead of pre-flight probing.
 probe_gateway_model() {
@@ -216,7 +254,7 @@ probe_gateway_model() {
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
     -H "Authorization: Bearer ${GATEWAY_API_KEY:-}" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+    -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$PROBE_MAX_TOKENS}" \
     "$VPS_GATEWAY_URL/v1/chat/completions" 2>/dev/null) || return 1
   [ "$code" = "200" ]
 }
