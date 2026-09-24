@@ -47,6 +47,7 @@
 #   OPENCODE_NICE     CPU niceness for active runs (default: 10)
 #   OPENCODE_IONICE   I/O priority class for active runs (default: 3/idle)
 #   OPENCODE_MEMORY_MAX_MB optional systemd user-scope memory cap
+#   PAUSE_ON_HUMAN     pause claims while a user's opencode/omp session exists (default: 1)
 #   VPS_GATEWAY_URL   gateway base URL for model probes (default: http://100.71.95.75:8000)
 #   STALE_TIMEOUT     watchdog frees tasks after this many seconds of no heartbeat (default: 600)
 #   LOCK_TTL          sweep frees other-host locks idle this long, seconds (default: 172800 = 48h)
@@ -114,8 +115,10 @@ IN_PROGRESS_LABEL="${IN_PROGRESS_LABEL:-status:in_progress}"
 #nous/stealth/ox-alpha REMOVED 2026-09-08: model no longer exists upstream (40s empty runs rubber-stamped as done, see #841).
 DEFAULT_MODEL_CHAIN="crowllm/gpt-5.6-sol,crowllm/glm-5.3,crowllm/kimi-k3,vps-gateway/coding-elite,vps-gateway/coding-smart"
 MODEL_CHAIN="${OPENCODE_MODEL_CHAIN:-}"
-[ -z "$MODEL_CHAIN" ] && [ -r "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" ] && \
-  MODEL_CHAIN="$(grep -Ev '^[[:space:]]*(#|$)' "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" | paste -sd, -)"
+if [ -z "$MODEL_CHAIN" ] && [ -r "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" ]; then
+  inventory="$(grep -Ev '^[[:space:]]*(#|$)' "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" || true)"
+  [ -n "$inventory" ] && MODEL_CHAIN="$(printf '%s\n' "$inventory" | paste -sd, -)"
+fi
 [ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:+$OPENCODE_MODEL,}$DEFAULT_MODEL_CHAIN"
 IFS=',' read -r -a MODELS <<< "$MODEL_CHAIN"
 VPS_GATEWAY_URL="${VPS_GATEWAY_URL:-http://100.71.95.75:8000}"
@@ -123,6 +126,7 @@ MIN_LOG_BYTES="${MIN_LOG_BYTES:-200}"
 OPENCODE_NICE="${OPENCODE_NICE:-10}"
 OPENCODE_IONICE="${OPENCODE_IONICE:-3}"
 OPENCODE_MEMORY_MAX_MB="${OPENCODE_MEMORY_MAX_MB:-}"
+PAUSE_ON_HUMAN="${PAUSE_ON_HUMAN:-1}"
 # ponytail: targeted key extraction instead of sourcing ~/.env (stray-line exec gotcha)
 if [ -z "${GATEWAY_API_KEY:-}" ] && [ -f "$HOME/.env" ]; then
   GATEWAY_API_KEY="$(grep -E '^GATEWAY_API_KEY=' "$HOME/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'"' || true)"
@@ -194,6 +198,12 @@ run_opencode() {
   else
     "${cmd[@]}"
   fi
+}
+
+human_active() {
+  [ "$PAUSE_ON_HUMAN" = "1" ] || return 1
+  pgrep -u "$(id -u)" -x opencode >/dev/null 2>&1 ||
+    pgrep -u "$(id -u)" -x omp >/dev/null 2>&1
 }
 
 # probe_gateway_model MODEL -> 0 if gateway virtual model answers a 1-token ping
@@ -661,6 +671,11 @@ sweep_stale_locks || true  # startup reclaim before first claim
 while :; do
   heartbeat
   sweep_stale_locks || true  # throttled by SWEEP_INTERVAL
+  if human_active; then
+    heartbeat "human OpenCode session active, pausing claims"
+    sleep "$IDLE_SLEEP"
+    continue
+  fi
   N="$(next_issue || true)"
   if [ -z "$N" ]; then
     heartbeat "no claimable issues, sleeping ${IDLE_SLEEP}s"
