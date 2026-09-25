@@ -1,19 +1,14 @@
 [Unit]
-Description=task-board-loop watchdog (auto-restart on silent failure)
+Description=task-board-loop watchdog (identity-safe stale process termination)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-# If the loop has been silent for > 30 min, kill it; systemd will restart.
-ExecStart=/bin/bash -c '\
-  HB=/tmp/agent-loop.heartbeat; \
-  if [ ! -f "$$HB" ]; then exit 0; fi; \
-  AGE=$$(( $$(date +%s) - $$(stat -c %Y "$$HB") )); \
-  if [ $$AGE -gt 1800 ]; then \
-    pkill -f task-board-loop.sh || true; \
-    echo "task-board-loop silent for $${AGE}s, killed" >> /var/log/agent-loop-watchdog.log; \
-  fi'
+Environment=HEARTBEAT_FILE=/tmp/agent-loop.heartbeat
+Environment=LOOP_PID_FILE=/tmp/task-board-loop.pid
+Environment=WATCHDOG_MAX_AGE=1800
+ExecStart=%h/task-board-loop/task-board-loop-watchdog.sh
 
 [Install]
 WantedBy=default.target
