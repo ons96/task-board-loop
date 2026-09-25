@@ -1,6 +1,6 @@
 [Unit]
 Description=task-board-loop watchdog timer (every 10 min)
-Requires=task-board-loop-watchdog.service
+After=network-online.target
 
 [Timer]
 OnBootSec=10min

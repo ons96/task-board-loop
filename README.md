@@ -27,6 +27,7 @@ Autonomous multi-device task worker for [ons96/task-board](https://github.com/on
 cd task-board-loop
 cp task-board-loop-watchdog.service ~/.config/systemd/user/
 cp task-board-loop-watchdog.timer   ~/.config/systemd/user/
+install -m 0755 task-board-loop-watchdog.sh ~/task-board-loop/task-board-loop-watchdog.sh
 systemctl --user enable --now task-board-loop-watchdog.timer
 
 # start the loop (runs forever, one issue at a time)
@@ -110,6 +111,7 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Set `SIMULATE_FAIL_FIRST=N` with `--simulate` to force a dead first attempt and verify fallback selection; invalid values fail without external calls.
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
 - Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored. Use only recently verified models; the built-in list remains the fallback.
+- Set `FREE_MODEL_ALLOWLIST` to the comma-separated subset of the chain backed by current free-tier evidence; live runs fail closed when it is missing or excludes every candidate.
 
 ## Session-close reconciliation
 

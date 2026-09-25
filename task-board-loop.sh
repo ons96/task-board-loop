@@ -43,6 +43,7 @@
 #   OPENCODE_TIMEOUT  max seconds per /work (default: 1800 = 30min)
 #   MAX_RETRIES       per-issue retry count on transient failure (default: 2)
 #   OPENCODE_MODEL_CHAIN comma-separated opencode model ids; retry advances to next (default below)
+#   FREE_MODEL_ALLOWLIST comma-separated models with current verified-free evidence; required for live runs
 #   OPENCODE_MODEL    if set, prepended to the chain as first choice
 #   MIN_LOG_BYTES     verify gate: /work log smaller than this = failure (default: 200)
 #   OPENCODE_NICE     CPU niceness for active runs (default: 10)
@@ -324,6 +325,33 @@ if [ "$SELF_TEST" = "1" ]; then
   [ "$fails" = "0" ] && { echo "self-test: ALL PASS"; exit 0; } || { echo "self-test: $fails FAILURES"; exit 1; }
 fi
 
+# Live work fails closed unless every eligible fallback is backed by current
+# free-tier evidence supplied by the operator; never infer price from a provider name.
+if [ "$SELF_TEST" != "1" ]; then
+  FREE_MODEL_ALLOWLIST="${FREE_MODEL_ALLOWLIST:-}"
+  if [ -z "$FREE_MODEL_ALLOWLIST" ]; then
+    echo "FREE_MODEL_ALLOWLIST required; include only models with current verified-free evidence" >&2
+    exit 2
+  fi
+  IFS=',' read -r -a free_models <<< "$FREE_MODEL_ALLOWLIST"
+  allowed_models=()
+  for candidate in "${MODELS[@]}"; do
+    candidate="$(echo "$candidate" | xargs)"
+    for free_model in "${free_models[@]}"; do
+      free_model="$(echo "$free_model" | xargs)"
+      if [[ "$candidate" == "$free_model" ]]; then
+        allowed_models+=("$candidate")
+        break
+      fi
+    done
+  done
+  if [ "${#allowed_models[@]}" -eq 0 ]; then
+    echo "model chain has no entries in FREE_MODEL_ALLOWLIST" >&2
+    exit 2
+  fi
+  MODELS=("${allowed_models[@]}")
+fi
+
 [ -d "$REPO/.git" ] || { echo "warning: launch cwd not a git repo: $REPO (per-issue resolution will be used)" >&2; }
 command -v gh >/dev/null || { echo "gh CLI required" >&2; exit 1; }
 command -v "$OPENCODE_BIN" >/dev/null || { echo "opencode not on PATH" >&2; exit 1; }
@@ -355,6 +383,10 @@ BLOCKED=0
 FAILED=0
 
 # --- heartbeat (file for systemd watchdog timer) ---
+LOOP_PID_FILE="${LOOP_PID_FILE:-/tmp/task-board-loop.pid}"
+printf '%s\n' "$$" > "$LOOP_PID_FILE"
+cleanup_pid() { [ "$(cat "$LOOP_PID_FILE" 2>/dev/null || true)" != "$$" ] || rm -f "$LOOP_PID_FILE"; }
+trap cleanup_pid EXIT
 heartbeat() {
   date -u +%Y-%m-%dT%H:%M:%SZ > "$HEARTBEAT_FILE"
   echo "[$(date +%H:%M:%S)] $*" >&2
