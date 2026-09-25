@@ -85,7 +85,7 @@ done
 
 # Simulation exits before env loading, filesystem setup, gh, curl, OpenCode, or git.
 if [ "$SIMULATE" = "1" ]; then
-  sim_chain="${OPENCODE_MODEL_CHAIN:-crowllm/gpt-5.6-sol,vps-gateway/coding-fast}"
+  sim_chain="${OPENCODE_MODEL_CHAIN:-vps-gateway/coding-fast,vps-gateway/coding-smart}"
   sim_probe_tokens="${PROBE_MAX_TOKENS:-15}"
   sim_min_log="${MIN_LOG_BYTES:-200}"
   IFS=',' read -r -a sim_models <<< "$sim_chain"
@@ -151,13 +151,26 @@ IN_PROGRESS_LABEL="${IN_PROGRESS_LABEL:-status:in_progress}"
 # Comma-separated; retry N uses chain position (round-robin). vps-gateway/* virtual models
 # have gateway-internal fallback chains AND are curl-probed pre-flight; dead ones are skipped.
 #nous/stealth/ox-alpha REMOVED 2026-09-08: model no longer exists upstream (40s empty runs rubber-stamped as done, see #841).
-DEFAULT_MODEL_CHAIN="crowllm/gpt-5.6-sol,crowllm/glm-5.3,crowllm/kimi-k3,vps-gateway/coding-elite,vps-gateway/coding-smart"
+# A chain must be supplied from a recent probe inventory; guessed model IDs can
+# turn every retry into a fast failure or silently route to a paid model.
+DEFAULT_MODEL_CHAIN=""
 MODEL_CHAIN="${OPENCODE_MODEL_CHAIN:-}"
-if [ -z "$MODEL_CHAIN" ] && [ -r "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" ]; then
-  inventory="$(grep -Ev '^[[:space:]]*(#|$)' "${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}" || true)"
+MODEL_CHAIN_FILE="${OPENCODE_MODEL_CHAIN_FILE:-$HOME/.config/opencode/model-chain.txt}"
+if [ -z "$MODEL_CHAIN" ] && [ -r "$MODEL_CHAIN_FILE" ]; then
+  inventory="$(grep -Ev '^[[:space:]]*(#|$)' "$MODEL_CHAIN_FILE" || true)"
   [ -n "$inventory" ] && MODEL_CHAIN="$(printf '%s\n' "$inventory" | paste -sd, -)"
 fi
-[ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:+$OPENCODE_MODEL,}$DEFAULT_MODEL_CHAIN"
+[ -z "$MODEL_CHAIN" ] && MODEL_CHAIN="${OPENCODE_MODEL:-}"
+if [ -z "$MODEL_CHAIN" ] && [ "$SELF_TEST" = "1" ]; then
+  MODEL_CHAIN="self-test/model"
+fi
+if [ -z "$MODEL_CHAIN" ] && [ "$SIMULATE" = "1" ]; then
+  MODEL_CHAIN="vps-gateway/coding-fast,vps-gateway/coding-smart"
+fi
+if [ -z "$MODEL_CHAIN" ]; then
+  echo "no model chain: provide OPENCODE_MODEL_CHAIN or a probed OPENCODE_MODEL_CHAIN_FILE" >&2
+  exit 2
+fi
 IFS=',' read -r -a MODELS <<< "$MODEL_CHAIN"
 VPS_GATEWAY_URL="${VPS_GATEWAY_URL:-http://100.71.95.75:8000}"
 PROBE_MAX_TOKENS="${PROBE_MAX_TOKENS:-15}"
@@ -278,6 +291,18 @@ verify_work() {
   [ "$(git -C "$wt" rev-list --count "origin/$MAIN_BRANCH..$branch" 2>/dev/null || echo 0)" -gt 0 ]
 }
 
+# Append actionable process errors even when OpenCode exits without writing stdout.
+record_attempt_failure() {
+  local model="$1" result="$2" size
+  size=0
+  [ ! -f "$logf" ] || size="$(wc -c < "$logf")"
+  printf '\n[task-board-loop] attempt failed: model=%s exit=%s log_bytes=%s\n' \
+    "$model" "$result" "$size" >> "$logf"
+  if [ "$size" -eq 0 ]; then
+    printf '[task-board-loop] OpenCode produced no output; inspect binary, model configuration, and provider connectivity.\n' >> "$logf"
+  fi
+}
+
 if [ "$SELF_TEST" = "1" ]; then
   fails=0
   check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "ok: $d"; else echo "FAIL: $d"; fails=$((fails+1)); fi; }
@@ -315,6 +340,10 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'banner only' > "$vlog"   # 11 bytes < MIN_LOG_BYTES
   echo change2 > "$vdir/wt/seed"
   check_not "verify fails: dirty tree but tiny log" verify_work "$vlog" "$vdir/wt" work/1
+  git -C "$vdir/wt" reset --hard -q HEAD
+  printf '%200s' '' > "$vlog"
+  git -C "$vdir/wt" checkout -q main
+  check_not "verify fails: substantial log without work product" verify_work "$vlog" "$vdir/wt" main
   rm -rf "$vdir"
   else
     echo "FAIL: vwtest repo setup"; fails=$((fails+1)); rm -rf "$vdir"
@@ -711,6 +740,9 @@ EOF
       DONE=$((DONE+1))
       return 0
     fi
+    if [ "$result" != "0" ]; then
+      record_attempt_failure "$model" "$result"
+    fi
     retry=$((retry+1))
     if [ "$retry" -le "$MAX_RETRIES" ]; then
       heartbeat "attempt $retry failed (exit=$result), retrying in 30s"
@@ -721,8 +753,9 @@ EOF
   # all retries exhausted
   local log_tail=""
   if [ -f "$logf" ]; then
-    log_tail="$(tail -c 2000 "$logf" | tail -5 | sed 's/`/'"'"'/g')"
+    log_tail="$(tail -c 4000 "$logf" | tail -12 | sed 's/`/'"'"'/g')"
   fi
+  [ -n "$log_tail" ] || log_tail="No provider output; see per-attempt failure diagnostics in $logf."
   comment "$n" "task-board-loop: failed after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Needs investigation. Last log lines:
 $log_tail"
   unclaim "$n" "$BLOCKED_LABEL"

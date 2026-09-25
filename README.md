@@ -110,7 +110,7 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - `--simulate` is safe for local validation: it exercises issue/model selection, the probe payload, and the verification threshold with mocks; it exits before `gh`, `curl`, OpenCode, git, or network setup.
 - Set `SIMULATE_FAIL_FIRST=N` with `--simulate` to force a dead first attempt and verify fallback selection; invalid values fail without external calls.
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
-- Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory to refresh fallback choices without editing the script; comments and blank lines are ignored. Use only recently verified models; the built-in list remains the fallback.
+- Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory of recently probed models; comments and blank lines are ignored. No guessed built-in fallback exists. `FREE_MODEL_ALLOWLIST` remains mandatory for live runs and restricts inventory entries to operator-verified free-tier models.
 - Set `FREE_MODEL_ALLOWLIST` to the comma-separated subset of the chain backed by current free-tier evidence; live runs fail closed when it is missing or excludes every candidate.
 
 ## Session-close reconciliation
