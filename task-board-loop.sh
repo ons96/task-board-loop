@@ -4,6 +4,8 @@
 # - Claims one (adds locked-by:<worker-id> + status:in_progress) - others skip
 # - Creates git worktree, runs /work, opens PR, comments on issue
 # - Handles errors, never force-pushes, never force-removes worktrees with changes
+# - Recovers occupied worktree paths: a stale wt dir from a dead run is reused or
+#   adopted (uncommitted leftovers kept, never force-removed), not a blocker (#929)
 # - Posts heartbeat comments so watchdog.sh detects liveness
 # - Marks status:blocked + comment if /work can't proceed
 # - Health: writes last-heartbeat to $HEARTBEAT_FILE for systemd watchdog timer
@@ -273,14 +275,27 @@ probe_gateway_model() {
   [ "$code" = "200" ]
 }
 
-# verify_work LOG WT BRANCH -> 0 only if the run produced real work.
+# worktree_fingerprint WT -> HEAD + sorted porcelain status.
+# Two identical fingerprints mean the worktree saw no new work between snapshots.
+worktree_fingerprint() {
+  local wt="$1"
+  git -C "$wt" rev-parse HEAD 2>/dev/null || echo "(no-head)"
+  git -C "$wt" status --porcelain 2>/dev/null | LC_ALL=C sort
+}
+
+# verify_work LOG WT BRANCH [BASELINE] -> 0 only if the run produced real work.
 # Gate: log at least MIN_LOG_BYTES (bogus runs were 33-byte banner-only) AND
-# (dirty worktree OR commits ahead of main).
+# (dirty worktree OR commits ahead of main). BASELINE (a worktree_fingerprint
+# snapshot taken before the run) additionally rejects no-op runs on adopted
+# worktrees whose pre-existing dirt would otherwise satisfy the gate (#929).
 verify_work() {
-  local log="$1" wt="$2" branch="$3"
+  local log="$1" wt="$2" branch="$3" baseline="${4:-}"
   [ -f "$log" ] || return 1
   [ "$(wc -c < "$log")" -ge "$MIN_LOG_BYTES" ] || return 1
   git -C "$wt" rev-parse --verify "$branch" >/dev/null 2>&1 || return 1
+  if [ -n "$baseline" ] && [ "$(worktree_fingerprint "$wt")" = "$baseline" ]; then
+    return 1
+  fi
   if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
     # ponytail: test gate, fail if tests exist and break
     if [ -f "$wt/package.json" ]; then (cd "$wt" && npm test -- --silent) || return 1; elif [ -f "$wt/pyproject.toml" ]; then (cd "$wt" && pytest -q) || return 1; fi
@@ -567,6 +582,90 @@ sweep_stale_locks() {
   done
 }
 
+# --- ensure worktree at path, recovering occupied paths (#929) ---
+# ensure_worktree WT BRANCH -> 0 when $WT is ready for /work; sets WORKTREE_ERR
+# with a human reason on failure. Recovery rules (a stale dir from a dead run
+# must not block the issue, see #897/#911):
+#   - path free                        -> worktree add -b BRANCH MAIN (or reuse existing BRANCH)
+#   - registered worktree of this repo on BRANCH -> reuse (clean) or adopt (dirty);
+#     uncommitted leftovers are kept and /work finishes them
+#   - registered on another/detached branch, clean -> checkout BRANCH (fetch fallback)
+#   - anything else (unregistered dir, different repo, dirty wrong branch,
+#     broken metadata) -> fail so the caller blocks the issue with the reason.
+# Never removes or resets anything; cleanup_worktree keeps the dirty-tree guard.
+ensure_worktree() {
+  local wt="$1" branch="$2"
+  local wt_real repo_real top wt_common repo_common wt_branch dirty
+  WORKTREE_ERR=""
+  if [ ! -e "$wt" ]; then
+    if git worktree add "$wt" -b "$branch" "$MAIN_BRANCH" 2>/dev/null; then return 0; fi
+    # ponytail: branch may exist locally or on the remote only (GHA-era work/N) - fetch, then reuse
+    git fetch origin "$branch" 2>/dev/null || true
+    if git worktree add "$wt" "$branch" 2>/dev/null; then
+      heartbeat "reusing existing branch $branch for $wt"
+      return 0
+    fi
+    WORKTREE_ERR="git worktree add failed for branch $branch"
+    return 1
+  fi
+  if [ ! -d "$wt" ]; then
+    WORKTREE_ERR="path exists but is not a directory"
+    return 1
+  fi
+  # occupied path: recover only when it is a live worktree of this repo
+  wt_real="$(cd "$wt" 2>/dev/null && pwd -P)"
+  repo_real="$(cd "$REPO" 2>/dev/null && pwd -P)"
+  if [ -z "$wt_real" ] || [ "$wt_real" = "$repo_real" ]; then
+    WORKTREE_ERR="path not accessible or is the repo itself"
+    return 1
+  fi
+  top="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$top" ] || [ "$top" != "$wt_real" ]; then
+    # also catches plain dirs inside the repo (git would climb to the repo root)
+    WORKTREE_ERR="path occupied by a directory that is not a worktree root of this repo (left in place)"
+    return 1
+  fi
+  if ! git -C "$wt" rev-parse --verify HEAD >/dev/null 2>&1; then
+    WORKTREE_ERR="worktree metadata broken (needs git worktree prune + manual salvage)"
+    return 1
+  fi
+  wt_common="$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null)"
+  repo_common="$(git rev-parse --git-common-dir 2>/dev/null)"
+  wt_common="$(cd "$wt_common" 2>/dev/null && pwd -P)"
+  repo_common="$(cd "$repo_common" 2>/dev/null && pwd -P)"
+  if [ -z "$wt_common" ] || [ "$wt_common" != "$repo_common" ]; then
+    WORKTREE_ERR="path occupied by a worktree of a different repo (left in place)"
+    return 1
+  fi
+  wt_branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "(unreadable)")"
+  if [ "$wt_branch" = "$branch" ]; then
+    dirty="$(git -C "$wt" status --porcelain 2>/dev/null)"
+    if [ -n "$dirty" ]; then
+      heartbeat "adopting existing worktree $wt on branch $branch (uncommitted changes from a previous run are kept)"
+    else
+      heartbeat "reusing existing worktree $wt on branch $branch"
+    fi
+    return 0
+  fi
+  # different or detached branch: repair only a clean tree; a dirty one needs manual salvage
+  if [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    git fetch origin "$branch" 2>/dev/null || true
+    if git -C "$wt" checkout "$branch" 2>/dev/null; then
+      heartbeat "repaired worktree $wt: switched from $wt_branch to $branch"
+      return 0
+    fi
+    if ! git show-ref --verify --quiet "refs/heads/$branch" && \
+       git -C "$wt" checkout -b "$branch" "$MAIN_BRANCH" 2>/dev/null; then
+      heartbeat "repaired worktree $wt: created branch $branch from $MAIN_BRANCH"
+      return 0
+    fi
+    WORKTREE_ERR="worktree on branch $wt_branch could not be switched to $branch (branch checked out elsewhere?)"
+    return 1
+  fi
+  WORKTREE_ERR="uncommitted changes on branch $wt_branch, expected $branch (manual salvage needed)"
+  return 1
+}
+
 # --- cleanup worktree safely (never force-removes with changes) ---
 cleanup_worktree() {
   local wt="$1"
@@ -661,18 +760,19 @@ do_issue() {
   local wt="$WORKTREE_DIR/wt-$n"
   local branch="work/$n"
 
-  # create worktree
-  heartbeat "creating worktree $wt on branch $branch"
-  if ! git worktree add "$wt" -b "$branch" "$MAIN_BRANCH" 2>/dev/null; then
-    # ponytail: branch may exist on remote only (GHA-era work/N) - fetch before reusing it
-    git fetch origin "$branch" 2>/dev/null || true
-    git worktree add "$wt" "$branch" 2>/dev/null || {
-      comment "$n" "task-board-loop: failed to create worktree, marking blocked"
-      unclaim "$n" "$BLOCKED_LABEL"
-      BLOCKED=$((BLOCKED+1))
-      return 1
-    }
+  # create or recover worktree (#929: an occupied wt path from a dead run must not block)
+  heartbeat "ensuring worktree $wt on branch $branch"
+  if ! ensure_worktree "$wt" "$branch"; then
+    comment "$n" "task-board-loop: worktree not recoverable (${WORKTREE_ERR:-unknown reason}), marking blocked"
+    unclaim "$n" "$BLOCKED_LABEL"
+    BLOCKED=$((BLOCKED+1))
+    return 1
   fi
+
+  # baseline fingerprint: pre-existing dirt on an adopted worktree must not
+  # satisfy the verify gate on its own - only new work may (#929)
+  local base_fp=""
+  [ "$DRY" = "1" ] || base_fp="$(worktree_fingerprint "$wt" || true)"
 
   # run opencode with /work prompt, retry up to MAX_RETRIES times
   local model logf="$LOG_DIR/issue-$n.log"
@@ -712,7 +812,7 @@ EOF
     fi
     # verify-before-done gate (#841): exit-0 alone is NOT success
     if [ "$result" = "0" ] && [ "$DRY" != "1" ]; then
-      if verify_work "$logf" "$wt" "$branch"; then
+      if verify_work "$logf" "$wt" "$branch" "$base_fp"; then
         heartbeat "verify OK for #$n (log $(wc -c < "$logf") bytes, real work present)"
       else
         heartbeat "verify FAILED for #$n (exit-0 but no work product) — downgrading"
