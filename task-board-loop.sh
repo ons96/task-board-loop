@@ -222,6 +222,28 @@ repo_available() {
   return 1
 }
 
+# find_checkout ROOT proj -> echo checkout dir under ROOT matching proj (case-insensitive), else 1
+# ponytail: linear dir scan instead of -d test so label case mismatches resolve (project:llm-api-key-proxy -> LLM-API-Key-Proxy)
+find_checkout() {
+  local root="$1" p d
+  p="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
+  for d in "$root"/*/; do
+    [ -e "${d}.git" ] || continue
+    if [ "$(basename "$d" | tr '[:upper:]' '[:lower:]')" = "$p" ]; then echo "${d%/}"; return 0; fi
+  done
+  return 1
+}
+
+# pick_claimable: read "num project-label" lines on stdin, echo first num whose repo is available
+pick_claimable() {
+  local num pl
+  while read -r num pl; do
+    [ -n "$num" ] || continue
+    if repo_available "${pl#project:}"; then echo "$num"; return 0; fi
+  done
+  return 1
+}
+
 # lock_same_host lock_label -> 0 if the lock belongs to this host (own worker or hostname substring)
 lock_same_host() {
   local l
@@ -316,6 +338,14 @@ if [ "$SELF_TEST" = "1" ]; then
   check "project:general is available" repo_available "general"
   check "local checkout is available" repo_available "Task-Board-Loop"
   check_not "missing checkout is unavailable" repo_available "llm-leaderboard-aggregate"
+  # #930 fixtures: skip-in-next_issue (pick_claimable) + refusal-in-resolve (find_checkout)
+  [ "$(printf '5 project:missing-repo\n7 project:task-board-loop\n' | pick_claimable)" = "7" ] && echo "ok: next_issue skips unavailable project" || { echo "FAIL: next_issue skips unavailable project"; fails=$((fails+1)); }
+  [ "$(printf '9 \n' | pick_claimable)" = "9" ] && echo "ok: next_issue keeps unpinned issue" || { echo "FAIL: next_issue keeps unpinned issue"; fails=$((fails+1)); }
+  ckdir="$(mktemp -d /tmp/cktest.XXXXXX)"
+  mkdir -p "$ckdir/LLM-API-Key-Proxy/.git" "$ckdir/noext"
+  check "find_checkout resolves case-insensitively" find_checkout "$ckdir" "llm-api-key-proxy"
+  check_not "find_checkout fails on missing project" find_checkout "$ckdir" "no-such-repo"
+  rm -rf "$ckdir"
   check "idle past ttl is stale" stale_by_ttl 100 0 50
   check "idle exactly ttl is stale" stale_by_ttl 100 50 50
   check_not "idle within ttl is live" stale_by_ttl 100 60 50
@@ -448,9 +478,7 @@ next_issue() {
       .[]
       | select((.labels | map(.name) | any(. == $done or . == $blocked or startswith("locked-by:"))) | not)
       | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "")"
-    ' | while read -r num pl; do
-    if repo_available "${pl#project:}"; then echo "$num"; break; fi
-  done
+    ' | pick_claimable || true
 }
 
 # --- claim issue (label-based, matches claim-task.sh) ---
@@ -608,15 +636,20 @@ stop_heartbeat_poster() {
 # Overrides globals (REPO/WORKTREE_DIR/etc) per-issue; falls back to launch values.
 # ponytail: mutates globals -- safe because loop is sequential (one do_issue at a time)
 resolve_repo_for_issue() {
-  local n="$1" proj hit="" d
+  local n="$1" proj hit=""
   proj="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq '.labels[].name' 2>/dev/null \
           | grep -oE '^project:[a-z0-9_-]+$' | head -1 | cut -d: -f2)"
-  # ponytail: linear dir scan instead of -d test so label case mismatches resolve (project:llm-api-key-proxy -> LLM-API-Key-Proxy)
   if [ -n "$proj" ]; then
-    for d in "$HOME/CodingProjects"/*/; do
-      [ -e "${d}.git" ] || continue
-      if [ "$(basename "$d" | tr '[:upper:]' '[:lower:]')" = "$proj" ]; then hit="${d%/}"; break; fi
-    done
+    hit="$(find_checkout "$HOME/CodingProjects" "$proj" || true)"
+  fi
+  # #930: never fall back to the launch repo when project: is set but unresolvable -
+  # running /work there does wrong-repo work (#830 bug class). Unclaim as blocked instead.
+  if [ -n "$proj" ] && [ -z "$hit" ]; then
+    heartbeat "project:$proj has no local checkout; refusing fallback repo for #$n"
+    comment "$n" "task-board-loop: project:$proj has no checkout on $WORKER_ID; refusing launch-repo fallback, marking blocked"
+    unclaim "$n" "$BLOCKED_LABEL"
+    BLOCKED=$((BLOCKED+1))
+    return 1
   fi
   if [ -n "$hit" ]; then
     REPO="$hit"
@@ -656,8 +689,11 @@ do_issue() {
   # ponytail: || true inside trap - a failing trap under set -e kills the whole script (seen live: double-unclaim after blocked path exited code 1)
   trap "stop_heartbeat_poster '$n' 2>/dev/null || true; unclaim '$n' '$BLOCKED_LABEL' 2>/dev/null || true" RETURN
 
-  # resolve target repo per-issue (multi-repo task-board support)
-  resolve_repo_for_issue "$n"
+  # resolve target repo per-issue (multi-repo task-board support);
+  # #930: abort (unclaim blocked via RETURN trap already fired inside resolve) when project: has no checkout
+  if ! resolve_repo_for_issue "$n"; then
+    return 1
+  fi
   local wt="$WORKTREE_DIR/wt-$n"
   local branch="work/$n"
 
