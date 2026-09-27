@@ -112,6 +112,20 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
 - Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory of recently probed models; comments and blank lines are ignored. No guessed built-in fallback exists. `FREE_MODEL_ALLOWLIST` remains mandatory for live runs and restricts inventory entries to operator-verified free-tier models.
 - Set `FREE_MODEL_ALLOWLIST` to the comma-separated subset of the chain backed by current free-tier evidence; live runs fail closed when it is missing or excludes every candidate.
+- Set `TASK_ALLOWED_SCOPES` to control which issues this worker claims. The default is `vps-155,gateway-40`, so the VPS loop stays specialized. The GitHub Actions runner is configured for `cross-device,github-actions`. Issues without a canonical scope tag are treated as `cross-device`, so they stay with the runner. A worker skips issues outside its configured scopes, and never claims an issue whose `project:` repo has no local checkout.
+
+### Scope routing contract
+
+| Worker | Scopes | Intended work |
+|---|---|---|
+| GitHub Actions runner | `cross-device`, `github-actions` | General repository coding, tests, Actions work |
+| VPS-155 loop | `vps-155`, `gateway-40` | VPS-local and gateway operations |
+| Laptop/manual loop | `device-local` | Laptop-only work |
+
+Every issue should carry exactly one `project:<repo>` label and one canonical
+scope tag: `cross-device`, `github-actions`, `vps-155`, `gateway-40`, or
+`device-local`. Workers never broaden their own scope and never fall back to the
+launch repo for issues pinned to another project.
 
 ## Session-close reconciliation
 
