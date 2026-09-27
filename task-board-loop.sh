@@ -52,6 +52,8 @@
 #   OPENCODE_IONICE   I/O priority class for active runs (default: 3/idle)
 #   OPENCODE_MEMORY_MAX_MB optional systemd user-scope memory cap
 #   PAUSE_ON_HUMAN     pause claims while a user's opencode/omp session exists (default: 1)
+#   TASK_ALLOWED_SCOPES comma-separated scope tags this worker may claim
+#                      (default: vps-155,gateway-40; VPS stays specialized)
 #   VPS_GATEWAY_URL   gateway base URL for model probes (default: http://100.71.95.75:8000)
 #   STALE_TIMEOUT     watchdog frees tasks after this many seconds of no heartbeat (default: 600)
 #   LOCK_TTL          sweep frees other-host locks idle this long, seconds (default: 172800 = 48h)
@@ -181,6 +183,7 @@ OPENCODE_NICE="${OPENCODE_NICE:-10}"
 OPENCODE_IONICE="${OPENCODE_IONICE:-3}"
 OPENCODE_MEMORY_MAX_MB="${OPENCODE_MEMORY_MAX_MB:-}"
 PAUSE_ON_HUMAN="${PAUSE_ON_HUMAN:-1}"
+TASK_ALLOWED_SCOPES="${TASK_ALLOWED_SCOPES:-vps-155,gateway-40}"
 # ponytail: targeted key extraction instead of sourcing ~/.env (stray-line exec gotcha)
 if [ -z "${GATEWAY_API_KEY:-}" ] && [ -f "$HOME/.env" ]; then
   GATEWAY_API_KEY="$(grep -E '^GATEWAY_API_KEY=' "$HOME/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'"' || true)"
@@ -214,13 +217,24 @@ LAST_SWEEP=0
 # stale_by_ttl now last_live ttl -> 0 (stale) if now-last_live >= ttl, else 1
 stale_by_ttl() { [ "$1" -ge "$(( $2 + $3 ))" ]; }
 
-# repo_available proj -> 0 if this device can work it (unpinned, general, or local checkout present)
+# repo_available proj -> 0 if this device has the matching checkout
 repo_available() {
   local p
   p="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
-  [ -z "$p" ] && return 0
-  [ "$p" = "general" ] && return 0
+  [ -z "$p" ] && return 1
   [[ ",$HAVE_PROJ," == *",$p,"* ]] && return 0
+  return 1
+}
+
+# scope_allowed SCOPE -> 0 when this worker is configured for the scope.
+# Untagged issues are cross-device by convention and stay with GH Actions.
+scope_allowed() {
+  local scope="${1:-cross-device}" allowed
+  IFS=',' read -ra allowed_scopes <<< "$TASK_ALLOWED_SCOPES"
+  for allowed in "${allowed_scopes[@]}"; do
+    allowed="$(echo "$allowed" | xargs)"
+    [ "$allowed" = "$scope" ] && return 0
+  done
   return 1
 }
 
@@ -236,11 +250,12 @@ find_checkout() {
   return 1
 }
 
-# pick_claimable: read "num project-label" lines on stdin, echo first num whose repo is available
+# pick_claimable: read "num project-label scope" lines, echo first eligible issue.
 pick_claimable() {
-  local num pl
-  while read -r num pl; do
+  local num pl scope
+  while read -r num pl scope; do
     [ -n "$num" ] || continue
+    scope_allowed "$scope" || continue
     if repo_available "${pl#project:}"; then echo "$num"; return 0; fi
   done
   return 1
@@ -349,13 +364,18 @@ if [ "$SELF_TEST" = "1" ]; then
   check_not "gha lock is other-host" lock_same_host "locked-by:gha-12345"
   check_not "other hostname is other-host" lock_same_host "locked-by:local-someotherhost99"
   HAVE_PROJ="task-board-loop,vps-gh-agent-loop"
-  check "unpinned issue is available" repo_available ""
-  check "project:general is available" repo_available "general"
+  check_not "unpinned project is unavailable" repo_available ""
+  check_not "missing general checkout is unavailable" repo_available "general"
   check "local checkout is available" repo_available "Task-Board-Loop"
   check_not "missing checkout is unavailable" repo_available "llm-leaderboard-aggregate"
-  # #930 fixtures: skip-in-next_issue (pick_claimable) + refusal-in-resolve (find_checkout)
-  [ "$(printf '5 project:missing-repo\n7 project:task-board-loop\n' | pick_claimable)" = "7" ] && echo "ok: next_issue skips unavailable project" || { echo "FAIL: next_issue skips unavailable project"; fails=$((fails+1)); }
-  [ "$(printf '9 \n' | pick_claimable)" = "9" ] && echo "ok: next_issue keeps unpinned issue" || { echo "FAIL: next_issue keeps unpinned issue"; fails=$((fails+1)); }
+  # #930 + scope fixtures: skip unavailable projects and route only configured scopes.
+  TASK_ALLOWED_SCOPES="vps-155,gateway-40"
+  [ "$(printf '5 project:missing-repo vps-155\n7 project:task-board-loop vps-155\n' | pick_claimable)" = "7" ] && echo "ok: next_issue skips unavailable project" || { echo "FAIL: next_issue skips unavailable project"; fails=$((fails+1)); }
+  [ -z "$(printf '9 project:task-board-loop cross-device\n' | pick_claimable)" ] && echo "ok: VPS skips cross-device issue" || { echo "FAIL: VPS claimed cross-device issue"; fails=$((fails+1)); }
+  TASK_ALLOWED_SCOPES="cross-device,github-actions"
+  [ "$(printf '9 project:task-board-loop cross-device\n' | pick_claimable)" = "9" ] && echo "ok: runner claims cross-device issue" || { echo "FAIL: runner skipped cross-device issue"; fails=$((fails+1)); }
+  [ -z "$(printf '10 project:task-board-loop vps-155\n' | pick_claimable)" ] && echo "ok: runner skips VPS issue" || { echo "FAIL: runner claimed VPS issue"; fails=$((fails+1)); }
+  [ "$(printf '11 project:task-board-loop\n' | pick_claimable)" = "11" ] && echo "ok: untagged issue defaults to cross-device" || { echo "FAIL: untagged issue routing"; fails=$((fails+1)); }
   ckdir="$(mktemp -d /tmp/cktest.XXXXXX)"
   mkdir -p "$ckdir/LLM-API-Key-Proxy/.git" "$ckdir/noext"
   check "find_checkout resolves case-insensitively" find_checkout "$ckdir" "llm-api-key-proxy"
@@ -488,11 +508,11 @@ next_issue() {
   else
     json="$(gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --state open --json number,labels --limit 100)"
   fi
-  # ponytail: first claimable candidate whose project: repo exists locally wins (skips silently otherwise)
+  # ponytail: first candidate in this worker's scope whose repo exists locally wins
   echo "$json" | jq -r --arg done "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" '
       .[]
       | select((.labels | map(.name) | any(. == $done or . == $blocked or startswith("locked-by:"))) | not)
-      | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "")"
+      | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "") \(.labels | map(.name) | map(select(startswith("tag:")) | sub("^tag:"; "") | select(. == "cross-device" or . == "device-local" or . == "vps-155" or . == "gateway-40" or . == "github-actions")) | .[0] // "cross-device")"
     ' | pick_claimable || true
 }
 
