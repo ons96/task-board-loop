@@ -141,6 +141,8 @@ fi
 IDLE_SLEEP="${IDLE_SLEEP:-60}"
 OPENCODE_TIMEOUT="${OPENCODE_TIMEOUT:-1800}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
+MAX_RECOVERY_REQUEUES="${MAX_RECOVERY_REQUEUES:-1}"
+RECOVERY_COOLDOWN="${RECOVERY_COOLDOWN:-300}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-300}"
 STALE_TIMEOUT="${STALE_TIMEOUT:-600}"
 LOCK_TTL="${LOCK_TTL:-172800}"
@@ -150,6 +152,8 @@ SWEEP_INTERVAL="${SWEEP_INTERVAL:-1800}"
 DONE_LABEL="${DONE_LABEL:-status:done}"
 BLOCKED_LABEL="${BLOCKED_LABEL:-status:blocked}"
 IN_PROGRESS_LABEL="${IN_PROGRESS_LABEL:-status:in_progress}"
+BLOCKED_REASON_PREFIX="${BLOCKED_REASON_PREFIX:-blocked_reason:}"
+ATTEMPTS_PREFIX="${ATTEMPTS_PREFIX:-attempts:}"
 
 # --- model chain (#841 follow-up): dead-model resilience ---
 # Comma-separated; retry N uses chain position (round-robin). vps-gateway/* virtual models
@@ -270,6 +274,56 @@ lock_same_host() {
   return 1
 }
 
+blocked_reason_from_log() {
+  local log="${1:-}" text
+  text="$(tail -c 12000 "$log" 2>/dev/null || true)"
+  if [[ "$text" =~ (401|403|unauthori[sz]ed|invalid[[:space:]_-]*api[[:space:]_-]*key|authentication) ]]; then
+    echo "auth_required"
+  elif [[ "$text" =~ (destructive|force[[:space:]_-]*push|drop[[:space:]_-]*database|delete[[:space:]_-]*production) ]]; then
+    echo "destructive_request"
+  elif [[ "$text" =~ (ambiguous|needs[[:space:]_-]*clarification|clarify[[:space:]_-]*before) ]]; then
+    echo "ambiguous_request"
+  elif [[ "$text" =~ (pytest|npm[[:space:]]+test|test[[:space:]]+failed|failing[[:space:]]+test) ]]; then
+    echo "tests_failed"
+  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
+    echo "provider_unavailable"
+  else
+    echo "execution_failed"
+  fi
+}
+
+reason_is_requeueable() {
+  case "${1:-}" in
+    provider_unavailable|transport_timeout) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+reason_label() { echo "${BLOCKED_REASON_PREFIX}${1}"; }
+attempts_label() { echo "${ATTEMPTS_PREFIX}${1}"; }
+
+issue_attempts() {
+  local n="$1" value
+  value="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels \
+    --jq --arg prefix "$ATTEMPTS_PREFIX" '[.labels[].name | select(startswith($prefix)) | sub("^" + $prefix; "")] | .[0] // "0"' 2>/dev/null || echo 0)"
+  [[ "$value" =~ ^[0-9]+$ ]] && echo "$value" || echo 0
+}
+
+set_issue_reason() {
+  local n="$1" reason="$2" attempts="$3" label old_labels old
+  label="$(reason_label "$reason")"
+  gh label create "$label" -R "$TASK_BOARD_REPO" --color "F9D0C4" 2>/dev/null || true
+  gh label create "$(attempts_label "$attempts")" -R "$TASK_BOARD_REPO" --color "D4C5F9" 2>/dev/null || true
+  old_labels="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels \
+    --jq --arg rp "$BLOCKED_REASON_PREFIX" --arg ap "$ATTEMPTS_PREFIX" \
+    '[.labels[].name | select(startswith($rp) or startswith($ap))] | .[]' 2>/dev/null || true)"
+  local -a args=(--add-label "$label" --add-label "$(attempts_label "$attempts")")
+  while IFS= read -r old; do
+    [ -n "$old" ] && [ "$old" != "$label" ] && [ "$old" != "$(attempts_label "$attempts")" ] && args+=(--remove-label "$old")
+  done <<< "$old_labels"
+  gh issue edit "$n" -R "$TASK_BOARD_REPO" "${args[@]}" 2>/dev/null || true
+}
+
 # --- model selection + verification (#841) ---
 # pick_model RETRY -> model for this attempt (round-robin over MODELS array)
 pick_model() {
@@ -384,6 +438,24 @@ if [ "$SELF_TEST" = "1" ]; then
   check "idle past ttl is stale" stale_by_ttl 100 0 50
   check "idle exactly ttl is stale" stale_by_ttl 100 50 50
   check_not "idle within ttl is live" stale_by_ttl 100 60 50
+  taxdir="$(mktemp -d /tmp/taxonomy.XXXXXX)"
+  printf '401 unauthorized API key\n' > "$taxdir/auth"
+  printf 'please force-push and delete production\n' > "$taxdir/destructive"
+  printf 'needs clarification before proceeding\n' > "$taxdir/ambiguous"
+  printf 'pytest test failed\n' > "$taxdir/tests"
+  printf 'upstream timeout HTTP 503\n' > "$taxdir/provider"
+  printf 'shell exited unexpectedly\n' > "$taxdir/execution"
+  [ "$(blocked_reason_from_log "$taxdir/auth")" = "auth_required" ] && echo "ok: auth taxonomy" || { echo "FAIL: auth taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/destructive")" = "destructive_request" ] && echo "ok: destructive taxonomy" || { echo "FAIL: destructive taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/ambiguous")" = "ambiguous_request" ] && echo "ok: ambiguous taxonomy" || { echo "FAIL: ambiguous taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/tests")" = "tests_failed" ] && echo "ok: tests taxonomy" || { echo "FAIL: tests taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/provider")" = "provider_unavailable" ] && echo "ok: provider taxonomy" || { echo "FAIL: provider taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/execution")" = "execution_failed" ] && echo "ok: execution taxonomy" || { echo "FAIL: execution taxonomy"; fails=$((fails+1)); }
+  check "provider failures requeue" reason_is_requeueable provider_unavailable
+  check "transport failures requeue" reason_is_requeueable transport_timeout
+  check_not "auth failures stay blocked" reason_is_requeueable auth_required
+  check_not "test failures stay blocked" reason_is_requeueable tests_failed
+  rm -rf "$taxdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
   # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
   MIN_LOG_BYTES=200
@@ -464,6 +536,7 @@ LAUNCH_WORKTREE_DIR="$WORKTREE_DIR"
 LAUNCH_MAIN_BRANCH="$MAIN_BRANCH"
 # ponytail: pre-claim repo-availability set (#830: 155 ran #834 in the wrong repo via launch fallback)
 HAVE_PROJ="$(basename "$LAUNCH_REPO" | tr '[:upper:]' '[:lower:]')"
+if [ -e "$HOME/CodingProjects/.git" ]; then HAVE_PROJ="$HAVE_PROJ,codingprojects"; fi
 for _d in "$HOME/CodingProjects"/*/; do
   [ -e "${_d}.git" ] || continue
   HAVE_PROJ="$HAVE_PROJ,$(basename "$_d" | tr '[:upper:]' '[:lower:]')"
@@ -775,19 +848,19 @@ resolve_repo_for_issue() {
     REPO_PARENT="$(dirname "$REPO")"
     REPO_NAME="$(basename "$REPO")"
     WORKTREE_DIR="$REPO_PARENT/${REPO_NAME}-worktrees"
-    MAIN_BRANCH="$(cd "$REPO" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    MAIN_BRANCH="$(git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    if [ "$proj" = "codingprojects" ]; then
+      MAIN_BRANCH="$(git -C "$REPO" symbolic-ref --short HEAD)"
+    fi
     # ponytail: origin/HEAD often unset locally; fall back main->master by inspection
     if [ -z "$MAIN_BRANCH" ]; then
-      if cd "$REPO" && git show-ref --verify --quiet refs/heads/main; then MAIN_BRANCH=main
-      elif git show-ref --verify --quiet refs/heads/master; then MAIN_BRANCH=master
-      else MAIN_BRANCH=$(git rev-parse --abbrev-ref HEAD); fi
+      if git -C "$REPO" show-ref --verify --quiet refs/heads/main; then MAIN_BRANCH=main
+      elif git -C "$REPO" show-ref --verify --quiet refs/heads/master; then MAIN_BRANCH=master
+      else MAIN_BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD); fi
     fi
   else
-    REPO="$LAUNCH_REPO"
-    REPO_PARENT="$(dirname "$REPO")"
-    REPO_NAME="$(basename "$REPO")"
-    WORKTREE_DIR="$LAUNCH_WORKTREE_DIR"
-    MAIN_BRANCH="$LAUNCH_MAIN_BRANCH"
+    heartbeat "project '$proj' has no matching checkout; refusing fallback repo"
+    return 1
   fi
   mkdir -p "$WORKTREE_DIR"
   cd "$REPO"
@@ -824,6 +897,8 @@ do_issue() {
     BLOCKED=$((BLOCKED+1))
     return 1
   fi
+  local baseline
+  baseline="$(git -C "$wt" rev-parse HEAD)"
 
   # baseline fingerprint: pre-existing dirt on an adopted worktree must not
   # satisfy the verify gate on its own - only new work may (#929)
@@ -912,9 +987,22 @@ EOF
     log_tail="$(tail -c 4000 "$logf" | tail -12 | sed 's/`/'"'"'/g')"
   fi
   [ -n "$log_tail" ] || log_tail="No provider output; see per-attempt failure diagnostics in $logf."
-  comment "$n" "task-board-loop: failed after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Needs investigation. Last log lines:
-$log_tail"
-  unclaim "$n" "$BLOCKED_LABEL"
+  local reason prior_attempts attempts
+  reason="$(blocked_reason_from_log "$logf")"
+  prior_attempts="$(issue_attempts "$n")"
+  attempts=$((prior_attempts + 1))
+  set_issue_reason "$n" "$reason" "$attempts"
+  comment "$n" "task-board-loop: blocked_reason=$reason attempts=$attempts after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Last log lines:
+ $log_tail"
+  if reason_is_requeueable "$reason" && [ "$prior_attempts" -lt "$MAX_RECOVERY_REQUEUES" ]; then
+    comment "$n" "task-board-loop: transient failure; bounded recovery requeue ${prior_attempts}/${MAX_RECOVERY_REQUEUES} after ${RECOVERY_COOLDOWN}s cooldown. Partial worktree preserved."
+    sleep "$RECOVERY_COOLDOWN"
+    gh issue edit "$n" -R "$TASK_BOARD_REPO" \
+      --remove-label "$IN_PROGRESS_LABEL" --remove-label "$LOCK_LABEL" \
+      --add-label "status:new" 2>/dev/null || true
+  else
+    unclaim "$n" "$BLOCKED_LABEL"
+  fi
   cleanup_worktree "$wt"
   stop_heartbeat_poster "$n"
   trap - RETURN
