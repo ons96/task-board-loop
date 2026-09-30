@@ -291,7 +291,9 @@ blocked_reason_from_log() {
     echo "ambiguous_request"
   elif [[ "$text" =~ (pytest|npm[[:space:]]+test|test[[:space:]]+failed|failing[[:space:]]+test) ]]; then
     echo "tests_failed"
-  elif [[ "$text" =~ (runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out|no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
+  elif [[ "$text" =~ (no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out) ]]; then
+    echo "no_work_product"
+  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
     echo "provider_unavailable"
   else
     echo "execution_failed"
@@ -300,15 +302,17 @@ blocked_reason_from_log() {
 
 reason_is_requeueable() {
   case "${1:-}" in
-    provider_unavailable|transport_timeout|worktree_unavailable) return 0 ;;
+    provider_unavailable|transport_timeout|worktree_unavailable|no_work_product) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 recovery_decision() {
-  local reason="${1:-}" prior="${2:-0}" limit="${3:-1}" locked="${4:-0}"
+  local reason="${1:-}" prior="${2:-0}" limit="${3:-1}" locked="${4:-0}" last="${5:-0}" now="${6:-0}" cooldown="${7:-0}"
   [[ "$prior" =~ ^[0-9]+$ && "$limit" =~ ^[0-9]+$ ]] || { echo blocked; return; }
+  [[ "$last" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && "$cooldown" =~ ^[0-9]+$ ]] || { echo blocked; return; }
   [ "$locked" = "0" ] || { echo blocked; return; }
+  [ "$now" -ge "$((last + cooldown))" ] || { echo cooldown; return; }
   reason_is_requeueable "$reason" && [ "$prior" -lt "$limit" ] && echo requeue || echo blocked
 }
 
@@ -342,6 +346,19 @@ set_issue_reason() {
     [ -n "$old" ] && [ "$old" != "$label" ] && [ "$old" != "$(attempts_label "$attempts")" ] && args+=(--remove-label "$old")
   done <<< "$old_labels"
   gh issue edit "$n" -R "$TASK_BOARD_REPO" "${args[@]}" 2>/dev/null || true
+}
+
+# Release only our own claim, and only if the issue is still in progress with our lock.
+requeue_claim() {
+  local n="$1" owner_labels state
+  state="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json state,labels \
+    --jq '{state:.state, labels:[.labels[].name]}' 2>/dev/null || echo '')"
+  [ -n "$state" ] || return 1
+  [ "$(echo "$state" | jq -r .state)" = OPEN ] || return 1
+  owner_labels="$(echo "$state" | jq -r --arg ours "$LOCK_LABEL" '[.labels[] | select(startswith("locked-by:") and . != $ours)] | length')"
+  [ "$owner_labels" = 0 ] || return 1
+  echo "$state" | jq -e --arg ours "$LOCK_LABEL" --arg progress "$IN_PROGRESS_LABEL" '.labels | index($ours) and index($progress)' >/dev/null || return 1
+  gh issue edit "$n" -R "$TASK_BOARD_REPO" --remove-label "$IN_PROGRESS_LABEL" --remove-label "$LOCK_LABEL" --add-label "status:new" 2>/dev/null
 }
 
 # --- model selection + verification (#841) ---
@@ -475,13 +492,14 @@ if [ "$SELF_TEST" = "1" ]; then
   [ "$(blocked_reason_from_log "$taxdir/ambiguous")" = "ambiguous_request" ] && echo "ok: ambiguous taxonomy" || { echo "FAIL: ambiguous taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/tests")" = "tests_failed" ] && echo "ok: tests taxonomy" || { echo "FAIL: tests taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/provider")" = "provider_unavailable" ] && echo "ok: provider taxonomy" || { echo "FAIL: provider taxonomy"; fails=$((fails+1)); }
-  [ "$(blocked_reason_from_log "$taxdir/runner")" = "provider_unavailable" ] && echo "ok: runner timeout/no-work taxonomy" || { echo "FAIL: runner timeout/no-work taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/runner")" = "no_work_product" ] && echo "ok: runner timeout/no-work taxonomy" || { echo "FAIL: runner timeout/no-work taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/checkout")" = "missing_checkout" ] && echo "ok: missing checkout taxonomy" || { echo "FAIL: missing checkout taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/occupied")" = "worktree_unavailable" ] && echo "ok: occupied worktree taxonomy" || { echo "FAIL: occupied worktree taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/credentials")" = "needs_user" ] && echo "ok: credential taxonomy" || { echo "FAIL: credential taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/needs-user")" = "needs_user" ] && echo "ok: needs-user taxonomy" || { echo "FAIL: needs-user taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/execution")" = "execution_failed" ] && echo "ok: execution taxonomy" || { echo "FAIL: execution taxonomy"; fails=$((fails+1)); }
   check "provider failures requeue" reason_is_requeueable provider_unavailable
+  check "no-work retries requeue" reason_is_requeueable no_work_product
   check "transport failures requeue" reason_is_requeueable transport_timeout
   check_not "auth failures stay blocked" reason_is_requeueable auth_required
   check_not "missing checkout stays blocked" reason_is_requeueable missing_checkout
@@ -490,6 +508,8 @@ if [ "$SELF_TEST" = "1" ]; then
   check "first transient recovery is allowed" test "$(recovery_decision provider_unavailable 0 1 0)" = requeue
   check_not "repeated transient failure stays blocked" test "$(recovery_decision provider_unavailable 1 1 0)" = requeue
   check_not "active lock prevents recovery" test "$(recovery_decision provider_unavailable 0 1 1)" = requeue
+  check_not "cooldown prevents early recovery" test "$(recovery_decision provider_unavailable 0 1 0 100 399 300)" = requeue
+  check "recovery allowed after cooldown" test "$(recovery_decision provider_unavailable 0 1 0 100 400 300)" = requeue
   check_not "missing checkout stays blocked" reason_is_requeueable missing_checkout
   check_not "worktree conflict stays blocked" reason_is_requeueable worktree_conflict
   check "recoverable occupied worktree classified" test "$(worktree_failure_reason 'git worktree add failed for branch')" = worktree_unavailable
@@ -622,9 +642,10 @@ next_issue() {
     json="$(gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --state open --json number,labels --limit 100)"
   fi
   # ponytail: first candidate in this worker's scope whose repo exists locally wins
-  echo "$json" | jq -r --arg done "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" '
+  echo "$json" | jq -r --arg done "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" --argjson now "$(date +%s)" '
       .[]
       | select((.labels | map(.name) | any(. == $done or . == $blocked or startswith("locked-by:"))) | not)
+      | select((.labels | map(.name) | map(select(startswith("recovery-after:")) | sub("^recovery-after:"; "") | tonumber? | select(. > $now)) | length) == 0)
       | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "") \(.labels | map(.name) | map(select(startswith("tag:")) | sub("^tag:"; "") | select(. == "cross-device" or . == "device-local" or . == "vps-155" or . == "gateway-40" or . == "github-actions")) | .[0] // "cross-device")"
     ' | pick_claimable || true
 }
@@ -878,7 +899,8 @@ resolve_repo_for_issue() {
   # running /work there does wrong-repo work (#830 bug class). Unclaim as blocked instead.
   if [ -n "$proj" ] && [ -z "$hit" ]; then
     heartbeat "project:$proj has no local checkout; refusing fallback repo for #$n"
-    comment "$n" "task-board-loop: project:$proj has no checkout on $WORKER_ID; refusing launch-repo fallback, marking blocked"
+    comment "$n" "task-board-loop: blocked_reason=missing_checkout attempts=0 last_failure_class=missing_checkout; project:$proj has no checkout on $WORKER_ID; refusing launch-repo fallback. Human/operator action required; not requeued."
+    set_issue_reason "$n" missing_checkout "$(issue_attempts "$n")"
     unclaim "$n" "$BLOCKED_LABEL"
     BLOCKED=$((BLOCKED+1))
     return 1
@@ -941,8 +963,11 @@ do_issue() {
     comment "$n" "task-board-loop: blocked_reason=$wt_reason attempts=$attempts last_failure_class=$wt_reason; worktree error: ${WORKTREE_ERR:-unknown reason}. Worktree preserved."
     if [ "$(recovery_decision "$wt_reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" = requeue ]; then
       comment "$n" "task-board-loop: bounded recovery requeue after ${RECOVERY_COOLDOWN}s cooldown; occupied worktree preserved."
-      sleep "$RECOVERY_COOLDOWN"
-      gh issue edit "$n" -R "$TASK_BOARD_REPO" --remove-label "$IN_PROGRESS_LABEL" --remove-label "$LOCK_LABEL" --add-label "status:new" 2>/dev/null || true
+      RECOVERY_NOT_BEFORE=$(( $(date +%s) + RECOVERY_COOLDOWN ))
+      label="recovery-after:${RECOVERY_NOT_BEFORE}"
+      gh label create "$label" -R "$TASK_BOARD_REPO" --color "C2E0C6" 2>/dev/null || true
+      gh issue edit "$n" -R "$TASK_BOARD_REPO" --add-label "$label" 2>/dev/null || true
+      requeue_claim "$n" || heartbeat "recovery skipped for #$n: issue state/lock changed"
     else
       unclaim "$n" "$BLOCKED_LABEL"
     fi
@@ -999,6 +1024,7 @@ EOF
         heartbeat "verify OK for #$n (log $(wc -c < "$logf") bytes, real work present)"
       else
         heartbeat "verify FAILED for #$n (exit-0 but no work product) — downgrading"
+        printf '\n[task-board-loop] verify failed: no work product\n' >> "$logf"
         result=1
       fi
     fi
@@ -1048,11 +1074,13 @@ EOF
  $log_tail"
   if [ "$(recovery_decision "$reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" = requeue ]; then
     comment "$n" "task-board-loop: transient failure; bounded recovery requeue ${prior_attempts}/${MAX_RECOVERY_REQUEUES} after ${RECOVERY_COOLDOWN}s cooldown. Partial worktree preserved."
-    sleep "$RECOVERY_COOLDOWN"
-    gh issue edit "$n" -R "$TASK_BOARD_REPO" \
-      --remove-label "$IN_PROGRESS_LABEL" --remove-label "$LOCK_LABEL" \
-      --add-label "status:new" 2>/dev/null || true
+    RECOVERY_NOT_BEFORE=$(( $(date +%s) + RECOVERY_COOLDOWN ))
+    label="recovery-after:${RECOVERY_NOT_BEFORE}"
+    gh label create "$label" -R "$TASK_BOARD_REPO" --color "C2E0C6" 2>/dev/null || true
+    gh issue edit "$n" -R "$TASK_BOARD_REPO" --add-label "$label" 2>/dev/null || true
+    requeue_claim "$n" || heartbeat "recovery skipped for #$n: issue state/lock changed"
   else
+    gh issue edit "$n" -R "$TASK_BOARD_REPO" --add-label "$BLOCKED_LABEL" 2>/dev/null || true
     unclaim "$n" "$BLOCKED_LABEL"
   fi
   if [ "$(recovery_decision "$reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" != requeue ]; then cleanup_worktree "$wt"; fi

@@ -25,6 +25,17 @@ Transient provider, timeout, or infrastructure failures should be requeued
 with evidence when safe. Do not invent solutions to ambiguous requirements,
 missing credentials, destructive operations, or unavailable repository access.
 
+Blocked issues use one `blocked_reason:<value>` label and one `attempts:<n>`
+label. Canonical reasons are `provider_unavailable`, `transport_timeout`,
+`worktree_unavailable`, and `no_work_product` (allowlisted for bounded retry),
+plus `needs_user`, `auth_required`, `missing_checkout`, `destructive_request`,
+`ambiguous_request`, `tests_failed`, `worktree_conflict`, and
+`execution_failed` (not automatically retried). Comments record
+`blocked_reason`, cumulative `attempts`, and `last_failure_class`. Recovery is
+limited to one additional queue attempt by default, honors cooldown, and must
+verify that the issue is open and still held by the recovering worker before
+releasing its lock. Preserve partial worktrees when a retry is queued.
+
 ## Required work discipline
 
 1. Read target-repository instructions before editing.

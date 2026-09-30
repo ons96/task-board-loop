@@ -102,6 +102,14 @@ Body:
 ```
 
 For small-fix / medium: one issue, no parent ref, no child refs.
+Every created issue must include exactly one `project:<repo>` label, exactly
+one `priority:P0`..`priority:P9` label (default `priority:P2`), exactly one
+`status:new` label, and exactly one canonical scope label prefixed `tag:`.
+Use `tag:github-actions` for ordinary repository work, `tag:cross-device` for
+cross-repository/general work, `tag:vps-155` or `tag:gateway-40` only for work
+requiring those hosts, and `tag:device-local` only for laptop-local work. Do
+not create an issue until its target repo and scope are known; do not emit
+multiple scope tags.
 
 ### 6. Mark assumptions + close
 Post a digest comment on the parent (or on the single issue) summarizing:
