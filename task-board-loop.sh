@@ -87,6 +87,68 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --- blocked_reason taxonomy + bounded recovery policy (#944) ---
+# Pure decision helpers: no gh/git/network/env side effects. Defined before the
+# --simulate block so recovery routing can be dry-run against fixtures offline.
+
+blocked_reason_from_log() {
+  local log="${1:-}" text
+  text="$(tail -c 12000 "$log" 2>/dev/null || true)"
+  if [[ "$text" =~ (missing[[:space:]_-]*checkout|no[[:space:]_-]*matching[[:space:]_-]*checkout|checkout[[:space:]_-]*not[[:space:]_-]*found|repository[[:space:]_-]*not[[:space:]_-]*found|access[[:space:]_-]*denied) ]]; then
+    echo "missing_checkout"
+  elif [[ "$text" =~ (occupied.*worktree|worktree.*(busy|occupied|locked)) ]]; then
+    echo "worktree_unavailable"
+  elif [[ "$text" =~ (missing[[:space:]_-]*credentials|needs[[:space:]_-]*user|operator[[:space:]_-]*action) ]]; then
+    echo "needs_user"
+  elif [[ "$text" =~ (401|403|unauthori[sz]ed|invalid[[:space:]_-]*api[[:space:]_-]*key|authentication) ]]; then
+    echo "auth_required"
+  elif [[ "$text" =~ (destructive|force[[:space:]_-]*push|drop[[:space:]_-]*database|delete[[:space:]_-]*production) ]]; then
+    echo "destructive_request"
+  elif [[ "$text" =~ (ambiguous|needs[[:space:]_-]*clarification|clarify[[:space:]_-]*before) ]]; then
+    echo "ambiguous_request"
+  elif [[ "$text" =~ (pytest|npm[[:space:]]+test|test[[:space:]]+failed|failing[[:space:]]+test) ]]; then
+    echo "tests_failed"
+  elif [[ "$text" =~ (no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out) ]]; then
+    echo "no_work_product"
+  elif [[ "$text" =~ (transport[[:space:]_-]*(timeout|reset|failure)|streaming[[:space:]_-]*abort|mcp[[:space:]_-]*transport) ]]; then
+    echo "transport_timeout"
+  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
+    echo "provider_unavailable"
+  else
+    echo "execution_failed"
+  fi
+}
+
+reason_is_requeueable() {
+  case "${1:-}" in
+    provider_unavailable|transport_timeout|worktree_unavailable|no_work_product) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+recovery_decision() {
+  local reason="${1:-}" prior="${2:-0}" limit="${3:-1}" locked="${4:-0}" last="${5:-0}" now="${6:-0}" cooldown="${7:-0}"
+  [[ "$prior" =~ ^[0-9]+$ && "$limit" =~ ^[0-9]+$ ]] || { echo blocked; return; }
+  [[ "$last" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && "$cooldown" =~ ^[0-9]+$ ]] || { echo blocked; return; }
+  [ "$locked" = "0" ] || { echo blocked; return; }
+  [ "$now" -ge "$((last + cooldown))" ] || { echo cooldown; return; }
+  reason_is_requeueable "$reason" && [ "$prior" -lt "$limit" ] && echo requeue || echo blocked
+}
+
+# Linear backoff: each queued recovery waits one extra base cooldown per prior
+# attempt, so raising MAX_RECOVERY_REQUEUES can never hammer the queue.
+recovery_cooldown_after() {
+  local base="${RECOVERY_COOLDOWN:-300}" prior="${1:-0}"
+  echo "$(( base * (prior + 1) ))"
+}
+
+worktree_failure_reason() {
+  case "${1:-}" in
+    *"different repo"*|*"not a worktree"*|*"metadata broken"*|*"dirty wrong branch"*|*"manual salvage"*) echo worktree_conflict ;;
+    *) echo worktree_unavailable ;;
+  esac
+}
+
 # Simulation exits before env loading, filesystem setup, gh, curl, OpenCode, or git.
 if [ "$SIMULATE" = "1" ]; then
   sim_chain="${OPENCODE_MODEL_CHAIN:-vps-gateway/coding-fast,vps-gateway/coding-smart}"
@@ -111,12 +173,48 @@ if [ "$SIMULATE" = "1" ]; then
   rm -f "$sim_log"
   [ "$sim_selected" = "101" ] || { echo "simulation: FAIL issue selection" >&2; exit 1; }
   [ "$sim_log_size" -ge "$sim_min_log" ] || { echo "simulation: FAIL verify gate" >&2; exit 1; }
+  # #944: dry-run recovery routing against a fixture issue list, no live mutation.
+  # Fields: reason|prior_attempts|limit|locked|last_live|now|cooldown|expected
+  sim_recovery_fixtures="provider_unavailable|0|1|0|100|500|300|requeue
+provider_unavailable|0|1|0|100|399|300|cooldown
+provider_unavailable|1|1|0|100|999|300|blocked
+transport_timeout|0|1|0|100|500|300|requeue
+worktree_unavailable|0|1|0|100|500|300|requeue
+no_work_product|0|1|0|100|500|300|requeue
+no_work_product|0|0|0|100|500|300|blocked
+auth_required|0|1|0|100|500|300|blocked
+needs_user|0|1|0|100|500|300|blocked
+missing_checkout|0|1|0|100|500|300|blocked
+destructive_request|0|1|0|100|500|300|blocked
+ambiguous_request|0|1|0|100|500|300|blocked
+tests_failed|0|1|0|100|500|300|blocked
+worktree_conflict|0|1|0|100|500|300|blocked
+execution_failed|0|1|0|100|500|300|blocked
+provider_unavailable|0|1|1|100|500|300|blocked
+provider_unavailable|x|1|0|0|0|0|blocked
+not-a-reason|0|1|0|100|500|300|blocked"
+  sim_recovery_fail=0
+  sim_recovery_total=0
+  while IFS='|' read -r sim_r sim_prior sim_lim sim_locked sim_last sim_now sim_cd sim_expect; do
+    [ -n "${sim_r:-}" ] || continue
+    sim_recovery_total=$((sim_recovery_total + 1))
+    sim_got="$(recovery_decision "$sim_r" "$sim_prior" "$sim_lim" "$sim_locked" "$sim_last" "$sim_now" "$sim_cd")"
+    if [ "$sim_got" != "$sim_expect" ]; then
+      echo "simulation: FAIL recovery fixture reason=$sim_r prior=$sim_prior locked=$sim_locked -> $sim_got (want $sim_expect)" >&2
+      sim_recovery_fail=1
+    fi
+  done <<< "$sim_recovery_fixtures"
+  [ "$(worktree_failure_reason 'uncommitted changes on branch work/9, expected work/10 (manual salvage needed)')" = worktree_conflict ] || \
+    { echo "simulation: FAIL salvage worktree must stay blocked" >&2; sim_recovery_fail=1; }
+  [ "$(worktree_failure_reason 'git worktree add failed for branch work/9')" = worktree_unavailable ] || \
+    { echo "simulation: FAIL recoverable worktree must requeue" >&2; sim_recovery_fail=1; }
+  [ "$sim_recovery_fail" = "0" ] || exit 1
   if [ "$sim_fail_first" -gt 0 ]; then
-    printf 'simulation: PASS\nissue_selected: #%s\nfailed_attempts: %s (forced dead)\nfallback_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
-      "$sim_selected" "$sim_attempt0" "$sim_next_model" "$sim_payload" "$sim_log_size"
+    printf 'simulation: PASS\nissue_selected: #%s\nfailed_attempts: %s (forced dead)\nfallback_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nrecovery_fixtures: %s pass (requeue/blocked/cooldown routing, no live mutation)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_next_model" "$sim_payload" "$sim_log_size" "$sim_recovery_total"
   else
-    printf 'simulation: PASS\nissue_selected: #%s\nattempt_0_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
-      "$sim_selected" "$sim_attempt0" "$sim_payload" "$sim_log_size"
+    printf 'simulation: PASS\nissue_selected: #%s\nattempt_0_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nrecovery_fixtures: %s pass (requeue/blocked/cooldown routing, no live mutation)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_payload" "$sim_log_size" "$sim_recovery_total"
   fi
   exit 0
 fi
@@ -272,57 +370,6 @@ lock_same_host() {
   [[ "$l" == "locked-by:$WORKER_LOWER" ]] && return 0
   [[ -n "$MY_HOST_LOWER" && "$MY_HOST_LOWER" != "unknown" && "$l" == *"$MY_HOST_LOWER"* ]] && return 0
   return 1
-}
-
-blocked_reason_from_log() {
-  local log="${1:-}" text
-  text="$(tail -c 12000 "$log" 2>/dev/null || true)"
-  if [[ "$text" =~ (missing[[:space:]_-]*checkout|no[[:space:]_-]*matching[[:space:]_-]*checkout|checkout[[:space:]_-]*not[[:space:]_-]*found|repository[[:space:]_-]*not[[:space:]_-]*found|access[[:space:]_-]*denied) ]]; then
-    echo "missing_checkout"
-  elif [[ "$text" =~ (occupied.*worktree|worktree.*(busy|occupied|locked)) ]]; then
-    echo "worktree_unavailable"
-  elif [[ "$text" =~ (missing[[:space:]_-]*credentials|needs[[:space:]_-]*user|operator[[:space:]_-]*action) ]]; then
-    echo "needs_user"
-  elif [[ "$text" =~ (401|403|unauthori[sz]ed|invalid[[:space:]_-]*api[[:space:]_-]*key|authentication) ]]; then
-    echo "auth_required"
-  elif [[ "$text" =~ (destructive|force[[:space:]_-]*push|drop[[:space:]_-]*database|delete[[:space:]_-]*production) ]]; then
-    echo "destructive_request"
-  elif [[ "$text" =~ (ambiguous|needs[[:space:]_-]*clarification|clarify[[:space:]_-]*before) ]]; then
-    echo "ambiguous_request"
-  elif [[ "$text" =~ (pytest|npm[[:space:]]+test|test[[:space:]]+failed|failing[[:space:]]+test) ]]; then
-    echo "tests_failed"
-  elif [[ "$text" =~ (no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out) ]]; then
-    echo "no_work_product"
-  elif [[ "$text" =~ (transport[[:space:]_-]*(timeout|reset|failure)|streaming[[:space:]_-]*abort|mcp[[:space:]_-]*transport) ]]; then
-    echo "transport_timeout"
-  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
-    echo "provider_unavailable"
-  else
-    echo "execution_failed"
-  fi
-}
-
-reason_is_requeueable() {
-  case "${1:-}" in
-    provider_unavailable|transport_timeout|worktree_unavailable|no_work_product) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-recovery_decision() {
-  local reason="${1:-}" prior="${2:-0}" limit="${3:-1}" locked="${4:-0}" last="${5:-0}" now="${6:-0}" cooldown="${7:-0}"
-  [[ "$prior" =~ ^[0-9]+$ && "$limit" =~ ^[0-9]+$ ]] || { echo blocked; return; }
-  [[ "$last" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && "$cooldown" =~ ^[0-9]+$ ]] || { echo blocked; return; }
-  [ "$locked" = "0" ] || { echo blocked; return; }
-  [ "$now" -ge "$((last + cooldown))" ] || { echo cooldown; return; }
-  reason_is_requeueable "$reason" && [ "$prior" -lt "$limit" ] && echo requeue || echo blocked
-}
-
-worktree_failure_reason() {
-  case "${1:-}" in
-    *"different repo"*|*"not a worktree"*|*"metadata broken"*|*"dirty wrong branch"*) echo worktree_conflict ;;
-    *) echo worktree_unavailable ;;
-  esac
 }
 
 reason_label() { echo "${BLOCKED_REASON_PREFIX}${1}"; }
