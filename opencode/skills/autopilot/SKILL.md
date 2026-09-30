@@ -105,6 +105,8 @@ For small-fix / medium: one issue, no parent ref, no child refs.
 Every created issue must include exactly one `project:<repo>` label, exactly
 one `priority:P0`..`priority:P9` label (default `priority:P2`), exactly one
 `status:new` label, and exactly one canonical scope label prefixed `tag:`.
+Apply all four labels to every issue at creation time; do not leave queue or
+routing labels to a later cleanup step.
 Use `tag:github-actions` for ordinary repository work, `tag:cross-device` for
 cross-repository/general work, `tag:vps-155` or `tag:gateway-40` only for work
 requiring those hosts, and `tag:device-local` only for laptop-local work. Do
@@ -168,6 +170,7 @@ delete.
 Before reporting back, verify:
 - [ ] Every issue has `status:new` label.
 - [ ] Every issue has `project:<repo>` label.
+- [ ] Every issue has exactly one priority label (`priority:P0`..`priority:P9`).
 - [ ] Every issue has a `tag:<scope>` label (allowed: cross-device,
       device-local, vps-155, gateway-40, github-actions).
 - [ ] Every issue has exactly one canonical `tag:<scope>` label and a

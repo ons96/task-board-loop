@@ -293,6 +293,8 @@ blocked_reason_from_log() {
     echo "tests_failed"
   elif [[ "$text" =~ (no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out) ]]; then
     echo "no_work_product"
+  elif [[ "$text" =~ (transport[[:space:]_-]*(timeout|reset|failure)|streaming[[:space:]_-]*abort|mcp[[:space:]_-]*transport) ]]; then
+    echo "transport_timeout"
   elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
     echo "provider_unavailable"
   else
@@ -482,6 +484,7 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'pytest test failed\n' > "$taxdir/tests"
   printf 'upstream timeout HTTP 503\n' > "$taxdir/provider"
   printf 'runner timeout: no work product\n' > "$taxdir/runner"
+  printf 'transport timeout while streaming\n' > "$taxdir/transport"
   printf 'project checkout not found\n' > "$taxdir/checkout"
   printf 'worktree path occupied by live worktree\n' > "$taxdir/occupied"
   printf 'missing credentials\n' > "$taxdir/credentials"
@@ -493,6 +496,7 @@ if [ "$SELF_TEST" = "1" ]; then
   [ "$(blocked_reason_from_log "$taxdir/tests")" = "tests_failed" ] && echo "ok: tests taxonomy" || { echo "FAIL: tests taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/provider")" = "provider_unavailable" ] && echo "ok: provider taxonomy" || { echo "FAIL: provider taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/runner")" = "no_work_product" ] && echo "ok: runner timeout/no-work taxonomy" || { echo "FAIL: runner timeout/no-work taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/transport")" = "transport_timeout" ] && echo "ok: transport taxonomy" || { echo "FAIL: transport taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/checkout")" = "missing_checkout" ] && echo "ok: missing checkout taxonomy" || { echo "FAIL: missing checkout taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/occupied")" = "worktree_unavailable" ] && echo "ok: occupied worktree taxonomy" || { echo "FAIL: occupied worktree taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/credentials")" = "needs_user" ] && echo "ok: credential taxonomy" || { echo "FAIL: credential taxonomy"; fails=$((fails+1)); }
@@ -505,6 +509,9 @@ if [ "$SELF_TEST" = "1" ]; then
   check_not "missing checkout stays blocked" reason_is_requeueable missing_checkout
   check_not "needs-user stays blocked" reason_is_requeueable needs_user
   check_not "test failures stay blocked" reason_is_requeueable tests_failed
+  check_not "destructive requests stay blocked" reason_is_requeueable destructive_request
+  check_not "ambiguous requests stay blocked" reason_is_requeueable ambiguous_request
+  check_not "repeated execution failures stay blocked" test "$(recovery_decision execution_failed 0 1 0)" = requeue
   check "first transient recovery is allowed" test "$(recovery_decision provider_unavailable 0 1 0)" = requeue
   check_not "repeated transient failure stays blocked" test "$(recovery_decision provider_unavailable 1 1 0)" = requeue
   check_not "active lock prevents recovery" test "$(recovery_decision provider_unavailable 0 1 1)" = requeue

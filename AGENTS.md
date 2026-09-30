@@ -25,8 +25,9 @@ Transient provider, timeout, or infrastructure failures should be requeued
 with evidence when safe. Do not invent solutions to ambiguous requirements,
 missing credentials, destructive operations, or unavailable repository access.
 
-Blocked issues use one `blocked_reason:<value>` label and one `attempts:<n>`
-label. Canonical reasons are `provider_unavailable`, `transport_timeout`,
+Blocked attempts use one `blocked_reason:<value>` label and one `attempts:<n>`
+label, whether left terminally blocked or queued for bounded recovery. Canonical
+reasons are `provider_unavailable`, `transport_timeout`,
 `worktree_unavailable`, and `no_work_product` (allowlisted for bounded retry),
 plus `needs_user`, `auth_required`, `missing_checkout`, `destructive_request`,
 `ambiguous_request`, `tests_failed`, `worktree_conflict`, and
