@@ -397,6 +397,21 @@ set_issue_reason() {
   gh issue edit "$n" -R "$TASK_BOARD_REPO" "${args[@]}" 2>/dev/null || true
 }
 
+# clear_issue_recovery N -> strip blocked_reason:*/attempts:*/recovery-after:*
+# labels so a recovered issue that finishes carries no blocked metadata (idempotent).
+clear_issue_recovery() {
+  local n="$1" old_labels old
+  old_labels="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels \
+    --jq --arg rp "$BLOCKED_REASON_PREFIX" --arg ap "$ATTEMPTS_PREFIX" \
+    '[.labels[].name | select(startswith($rp) or startswith($ap) or startswith("recovery-after:"))] | .[]' 2>/dev/null || true)"
+  [ -n "$old_labels" ] || return 0
+  local -a args=()
+  while IFS= read -r old; do [ -n "$old" ] && args+=(--remove-label "$old"); done <<< "$old_labels"
+  [ "${#args[@]}" -gt 0 ] || return 0
+  gh issue edit "$n" -R "$TASK_BOARD_REPO" "${args[@]}" 2>/dev/null || true
+  return 0
+}
+
 # Release only our own claim, and only if the issue is still in progress with our lock.
 requeue_claim() {
   local n="$1" owner_labels state
@@ -569,6 +584,13 @@ if [ "$SELF_TEST" = "1" ]; then
   check "recoverable occupied worktree classified" test "$(worktree_failure_reason 'git worktree add failed for branch')" = worktree_unavailable
   check "recoverable worktree failures requeue" reason_is_requeueable worktree_unavailable
   check "unsafe worktree conflict classified" test "$(worktree_failure_reason 'path occupied by a worktree of a different repo')" = worktree_conflict
+  check "dirty wrong-branch salvage stays a conflict" test "$(worktree_failure_reason 'uncommitted changes on branch work/9, expected work/10 (manual salvage needed)')" = worktree_conflict
+  check_not "invalid attempt count stays blocked" test "$(recovery_decision provider_unavailable x 1 0)" = requeue
+  check_not "empty reason stays blocked" test "$(recovery_decision '' 0 1 0)" = requeue
+  check_not "unknown reason stays blocked" test "$(recovery_decision not-a-reason 0 1 0)" = requeue
+  check "missing log classifies as execution failure" test "$(blocked_reason_from_log /nonexistent/no-such-log)" = execution_failed
+  check "first recovery uses base cooldown" test "$(recovery_cooldown_after 0)" = "$RECOVERY_COOLDOWN"
+  check "recovery backoff scales with attempts" test "$(recovery_cooldown_after 2)" = "$((RECOVERY_COOLDOWN * 3))"
   rm -rf "$taxdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
   # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
@@ -1015,9 +1037,12 @@ do_issue() {
     attempts=$((prior_attempts + 1))
     set_issue_reason "$n" "$wt_reason" "$attempts"
     comment "$n" "task-board-loop: blocked_reason=$wt_reason attempts=$attempts last_failure_class=$wt_reason; worktree error: ${WORKTREE_ERR:-unknown reason}. Worktree preserved."
-    if [ "$(recovery_decision "$wt_reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" = requeue ]; then
-      comment "$n" "task-board-loop: bounded recovery requeue after ${RECOVERY_COOLDOWN}s cooldown; occupied worktree preserved."
-      RECOVERY_NOT_BEFORE=$(( $(date +%s) + RECOVERY_COOLDOWN ))
+    local wt_recovery wt_cooldown
+    wt_recovery="$(recovery_decision "$wt_reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)"
+    if [ "$wt_recovery" = requeue ]; then
+      wt_cooldown="$(recovery_cooldown_after "$prior_attempts")"
+      comment "$n" "task-board-loop: bounded recovery requeue ${prior_attempts}/${MAX_RECOVERY_REQUEUES} after ${wt_cooldown}s cooldown/backoff; occupied worktree preserved."
+      RECOVERY_NOT_BEFORE=$(( $(date +%s) + wt_cooldown ))
       label="recovery-after:${RECOVERY_NOT_BEFORE}"
       gh label create "$label" -R "$TASK_BOARD_REPO" --color "C2E0C6" 2>/dev/null || true
       gh issue edit "$n" -R "$TASK_BOARD_REPO" --add-label "$label" 2>/dev/null || true
@@ -1026,6 +1051,8 @@ do_issue() {
       unclaim "$n" "$BLOCKED_LABEL"
     fi
     BLOCKED=$((BLOCKED+1))
+    # trap - RETURN: the default trap would re-apply status:blocked and undo the requeue
+    trap - RETURN
     return 1
   fi
   local baseline
@@ -1096,6 +1123,7 @@ EOF
         return 0
       fi
       comment "$n" "task-board-loop: completed on attempt $((retry+1)) (model=$model, verified: log $(wc -c < "$logf")B + worktree diff)"
+      clear_issue_recovery "$n"
       unclaim "$n" "$DONE_LABEL"
       cleanup_worktree "$wt"
       stop_heartbeat_poster "$n"
@@ -1119,16 +1147,18 @@ EOF
     log_tail="$(tail -c 4000 "$logf" | tail -12 | sed 's/`/'"'"'/g')"
   fi
   [ -n "$log_tail" ] || log_tail="No provider output; see per-attempt failure diagnostics in $logf."
-  local reason prior_attempts attempts
+  local reason prior_attempts attempts recovery recovery_cooldown
   reason="$(blocked_reason_from_log "$logf")"
   prior_attempts="$(issue_attempts "$n")"
   attempts=$((prior_attempts + 1))
   set_issue_reason "$n" "$reason" "$attempts"
   comment "$n" "task-board-loop: blocked_reason=$reason attempts=$attempts last_failure_class=$reason after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Last log lines:
  $log_tail"
-  if [ "$(recovery_decision "$reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" = requeue ]; then
-    comment "$n" "task-board-loop: transient failure; bounded recovery requeue ${prior_attempts}/${MAX_RECOVERY_REQUEUES} after ${RECOVERY_COOLDOWN}s cooldown. Partial worktree preserved."
-    RECOVERY_NOT_BEFORE=$(( $(date +%s) + RECOVERY_COOLDOWN ))
+  recovery="$(recovery_decision "$reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)"
+  if [ "$recovery" = requeue ]; then
+    recovery_cooldown="$(recovery_cooldown_after "$prior_attempts")"
+    comment "$n" "task-board-loop: transient failure; bounded recovery requeue ${prior_attempts}/${MAX_RECOVERY_REQUEUES} after ${recovery_cooldown}s cooldown/backoff. Partial worktree preserved."
+    RECOVERY_NOT_BEFORE=$(( $(date +%s) + recovery_cooldown ))
     label="recovery-after:${RECOVERY_NOT_BEFORE}"
     gh label create "$label" -R "$TASK_BOARD_REPO" --color "C2E0C6" 2>/dev/null || true
     gh issue edit "$n" -R "$TASK_BOARD_REPO" --add-label "$label" 2>/dev/null || true
@@ -1137,7 +1167,7 @@ EOF
     gh issue edit "$n" -R "$TASK_BOARD_REPO" --add-label "$BLOCKED_LABEL" 2>/dev/null || true
     unclaim "$n" "$BLOCKED_LABEL"
   fi
-  if [ "$(recovery_decision "$reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" != requeue ]; then cleanup_worktree "$wt"; fi
+  [ "$recovery" = requeue ] || cleanup_worktree "$wt"
   stop_heartbeat_poster "$n"
   trap - RETURN
   FAILED=$((FAILED+1))
