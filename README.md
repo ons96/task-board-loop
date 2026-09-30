@@ -87,9 +87,20 @@ Worktrees live on each device separately, so no branch collision.
 - `status:new` - work queue (issues must have this + no assignee + no `locked-by:*`)
 - `status:in_progress` - locked (auto-added on claim)
 - `status:done` - completed (auto-added on success)
-- `status:blocked` - needs user (auto-added on failure)
+- `status:blocked` - attempt cannot safely continue (auto-added on failure);
+  carries one `blocked_reason:<value>` label and one `attempts:<n>` label
 
 Priority labels: `priority:P0`..`priority:P9` (used for sort order)
+
+Blocked attempts record a canonical `blocked_reason` class:
+`provider_unavailable`, `transport_timeout`, `worktree_unavailable`, and
+`no_work_product` are transient and may be requeued once per budget
+(`MAX_RECOVERY_REQUEUES`, default 1) after a per-attempt cooldown/backoff
+(`recovery-after:<epoch>` label); `needs_user`, `auth_required`,
+`missing_checkout`, `destructive_request`, `ambiguous_request`, `tests_failed`,
+`worktree_conflict`, and `execution_failed` stay blocked for a human.
+Recovery releases only the recovering worker's own lock, preserves the
+partial worktree, and strips recovery labels once the issue completes.
 
 ## Safety
 
@@ -122,10 +133,12 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 | VPS-155 loop | `vps-155`, `gateway-40` | VPS-local and gateway operations |
 | Laptop/manual loop | `device-local` | Laptop-only work |
 
-Every issue should carry exactly one `project:<repo>` label and one canonical
-scope tag: `cross-device`, `github-actions`, `vps-155`, `gateway-40`, or
-`device-local`. Workers never broaden their own scope and never fall back to the
-launch repo for issues pinned to another project.
+At creation time every issue must carry exactly one `project:<repo>` label,
+exactly one `priority:P0`..`priority:P9` label, exactly one `status:new`
+label, and exactly one canonical scope tag: `cross-device`, `github-actions`,
+`vps-155`, `gateway-40`, or `device-local`. Workers never broaden their own
+scope and never fall back to the launch repo for issues pinned to another
+project.
 
 ## Session-close reconciliation
 
