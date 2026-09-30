@@ -269,7 +269,7 @@ pick_claimable() {
 lock_same_host() {
   local l
   l="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
-  [[ "$l" == "$WORKER_LOWER" ]] && return 0
+  [[ "$l" == "locked-by:$WORKER_LOWER" ]] && return 0
   [[ -n "$MY_HOST_LOWER" && "$MY_HOST_LOWER" != "unknown" && "$l" == *"$MY_HOST_LOWER"* ]] && return 0
   return 1
 }
@@ -277,7 +277,13 @@ lock_same_host() {
 blocked_reason_from_log() {
   local log="${1:-}" text
   text="$(tail -c 12000 "$log" 2>/dev/null || true)"
-  if [[ "$text" =~ (401|403|unauthori[sz]ed|invalid[[:space:]_-]*api[[:space:]_-]*key|authentication) ]]; then
+  if [[ "$text" =~ (missing[[:space:]_-]*checkout|no[[:space:]_-]*matching[[:space:]_-]*checkout|checkout[[:space:]_-]*not[[:space:]_-]*found|repository[[:space:]_-]*not[[:space:]_-]*found|access[[:space:]_-]*denied) ]]; then
+    echo "missing_checkout"
+  elif [[ "$text" =~ (occupied.*worktree|worktree.*(busy|occupied|locked)) ]]; then
+    echo "worktree_unavailable"
+  elif [[ "$text" =~ (missing[[:space:]_-]*credentials|needs[[:space:]_-]*user|operator[[:space:]_-]*action) ]]; then
+    echo "needs_user"
+  elif [[ "$text" =~ (401|403|unauthori[sz]ed|invalid[[:space:]_-]*api[[:space:]_-]*key|authentication) ]]; then
     echo "auth_required"
   elif [[ "$text" =~ (destructive|force[[:space:]_-]*push|drop[[:space:]_-]*database|delete[[:space:]_-]*production) ]]; then
     echo "destructive_request"
@@ -285,7 +291,7 @@ blocked_reason_from_log() {
     echo "ambiguous_request"
   elif [[ "$text" =~ (pytest|npm[[:space:]]+test|test[[:space:]]+failed|failing[[:space:]]+test) ]]; then
     echo "tests_failed"
-  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
+  elif [[ "$text" =~ (runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out|no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
     echo "provider_unavailable"
   else
     echo "execution_failed"
@@ -294,8 +300,22 @@ blocked_reason_from_log() {
 
 reason_is_requeueable() {
   case "${1:-}" in
-    provider_unavailable|transport_timeout) return 0 ;;
+    provider_unavailable|transport_timeout|worktree_unavailable) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+recovery_decision() {
+  local reason="${1:-}" prior="${2:-0}" limit="${3:-1}" locked="${4:-0}"
+  [[ "$prior" =~ ^[0-9]+$ && "$limit" =~ ^[0-9]+$ ]] || { echo blocked; return; }
+  [ "$locked" = "0" ] || { echo blocked; return; }
+  reason_is_requeueable "$reason" && [ "$prior" -lt "$limit" ] && echo requeue || echo blocked
+}
+
+worktree_failure_reason() {
+  case "${1:-}" in
+    *"different repo"*|*"not a worktree"*|*"metadata broken"*|*"dirty wrong branch"*) echo worktree_conflict ;;
+    *) echo worktree_unavailable ;;
   esac
 }
 
@@ -413,7 +433,7 @@ if [ "$SELF_TEST" = "1" ]; then
   fails=0
   check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "ok: $d"; else echo "FAIL: $d"; fails=$((fails+1)); fi; }
   check_not() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "FAIL: $d"; fails=$((fails+1)); else echo "ok: $d"; fi; }
-  check "own lock is same-host" lock_same_host "$LOCK_LABEL"
+  check "own lock is same-host" lock_same_host "locked-by:${WORKER_ID}"
   check "hostname-substring lock is same-host" lock_same_host "locked-by:local-${MY_HOST_LOWER}"
   check_not "gha lock is other-host" lock_same_host "locked-by:gha-12345"
   check_not "other hostname is other-host" lock_same_host "locked-by:local-someotherhost99"
@@ -444,17 +464,37 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'needs clarification before proceeding\n' > "$taxdir/ambiguous"
   printf 'pytest test failed\n' > "$taxdir/tests"
   printf 'upstream timeout HTTP 503\n' > "$taxdir/provider"
+  printf 'runner timeout: no work product\n' > "$taxdir/runner"
+  printf 'project checkout not found\n' > "$taxdir/checkout"
+  printf 'worktree path occupied by live worktree\n' > "$taxdir/occupied"
+  printf 'missing credentials\n' > "$taxdir/credentials"
+  printf 'needs-user decision required\n' > "$taxdir/needs-user"
   printf 'shell exited unexpectedly\n' > "$taxdir/execution"
   [ "$(blocked_reason_from_log "$taxdir/auth")" = "auth_required" ] && echo "ok: auth taxonomy" || { echo "FAIL: auth taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/destructive")" = "destructive_request" ] && echo "ok: destructive taxonomy" || { echo "FAIL: destructive taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/ambiguous")" = "ambiguous_request" ] && echo "ok: ambiguous taxonomy" || { echo "FAIL: ambiguous taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/tests")" = "tests_failed" ] && echo "ok: tests taxonomy" || { echo "FAIL: tests taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/provider")" = "provider_unavailable" ] && echo "ok: provider taxonomy" || { echo "FAIL: provider taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/runner")" = "provider_unavailable" ] && echo "ok: runner timeout/no-work taxonomy" || { echo "FAIL: runner timeout/no-work taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/checkout")" = "missing_checkout" ] && echo "ok: missing checkout taxonomy" || { echo "FAIL: missing checkout taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/occupied")" = "worktree_unavailable" ] && echo "ok: occupied worktree taxonomy" || { echo "FAIL: occupied worktree taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/credentials")" = "needs_user" ] && echo "ok: credential taxonomy" || { echo "FAIL: credential taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/needs-user")" = "needs_user" ] && echo "ok: needs-user taxonomy" || { echo "FAIL: needs-user taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/execution")" = "execution_failed" ] && echo "ok: execution taxonomy" || { echo "FAIL: execution taxonomy"; fails=$((fails+1)); }
   check "provider failures requeue" reason_is_requeueable provider_unavailable
   check "transport failures requeue" reason_is_requeueable transport_timeout
   check_not "auth failures stay blocked" reason_is_requeueable auth_required
+  check_not "missing checkout stays blocked" reason_is_requeueable missing_checkout
+  check_not "needs-user stays blocked" reason_is_requeueable needs_user
   check_not "test failures stay blocked" reason_is_requeueable tests_failed
+  check "first transient recovery is allowed" test "$(recovery_decision provider_unavailable 0 1 0)" = requeue
+  check_not "repeated transient failure stays blocked" test "$(recovery_decision provider_unavailable 1 1 0)" = requeue
+  check_not "active lock prevents recovery" test "$(recovery_decision provider_unavailable 0 1 1)" = requeue
+  check_not "missing checkout stays blocked" reason_is_requeueable missing_checkout
+  check_not "worktree conflict stays blocked" reason_is_requeueable worktree_conflict
+  check "recoverable occupied worktree classified" test "$(worktree_failure_reason 'git worktree add failed for branch')" = worktree_unavailable
+  check "recoverable worktree failures requeue" reason_is_requeueable worktree_unavailable
+  check "unsafe worktree conflict classified" test "$(worktree_failure_reason 'path occupied by a worktree of a different repo')" = worktree_conflict
   rm -rf "$taxdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
   # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
@@ -892,8 +932,20 @@ do_issue() {
   # create or recover worktree (#929: an occupied wt path from a dead run must not block)
   heartbeat "ensuring worktree $wt on branch $branch"
   if ! ensure_worktree "$wt" "$branch"; then
-    comment "$n" "task-board-loop: worktree not recoverable (${WORKTREE_ERR:-unknown reason}), marking blocked"
-    unclaim "$n" "$BLOCKED_LABEL"
+    local wt_reason
+    wt_reason="$(worktree_failure_reason "${WORKTREE_ERR:-unknown reason}")"
+    local prior_attempts attempts
+    prior_attempts="$(issue_attempts "$n")"
+    attempts=$((prior_attempts + 1))
+    set_issue_reason "$n" "$wt_reason" "$attempts"
+    comment "$n" "task-board-loop: blocked_reason=$wt_reason attempts=$attempts last_failure_class=$wt_reason; worktree error: ${WORKTREE_ERR:-unknown reason}. Worktree preserved."
+    if [ "$(recovery_decision "$wt_reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" = requeue ]; then
+      comment "$n" "task-board-loop: bounded recovery requeue after ${RECOVERY_COOLDOWN}s cooldown; occupied worktree preserved."
+      sleep "$RECOVERY_COOLDOWN"
+      gh issue edit "$n" -R "$TASK_BOARD_REPO" --remove-label "$IN_PROGRESS_LABEL" --remove-label "$LOCK_LABEL" --add-label "status:new" 2>/dev/null || true
+    else
+      unclaim "$n" "$BLOCKED_LABEL"
+    fi
     BLOCKED=$((BLOCKED+1))
     return 1
   fi
@@ -992,9 +1044,9 @@ EOF
   prior_attempts="$(issue_attempts "$n")"
   attempts=$((prior_attempts + 1))
   set_issue_reason "$n" "$reason" "$attempts"
-  comment "$n" "task-board-loop: blocked_reason=$reason attempts=$attempts after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Last log lines:
+  comment "$n" "task-board-loop: blocked_reason=$reason attempts=$attempts last_failure_class=$reason after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Last log lines:
  $log_tail"
-  if reason_is_requeueable "$reason" && [ "$prior_attempts" -lt "$MAX_RECOVERY_REQUEUES" ]; then
+  if [ "$(recovery_decision "$reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" = requeue ]; then
     comment "$n" "task-board-loop: transient failure; bounded recovery requeue ${prior_attempts}/${MAX_RECOVERY_REQUEUES} after ${RECOVERY_COOLDOWN}s cooldown. Partial worktree preserved."
     sleep "$RECOVERY_COOLDOWN"
     gh issue edit "$n" -R "$TASK_BOARD_REPO" \
@@ -1003,7 +1055,7 @@ EOF
   else
     unclaim "$n" "$BLOCKED_LABEL"
   fi
-  cleanup_worktree "$wt"
+  if [ "$(recovery_decision "$reason" "$prior_attempts" "$MAX_RECOVERY_REQUEUES" 0)" != requeue ]; then cleanup_worktree "$wt"; fi
   stop_heartbeat_poster "$n"
   trap - RETURN
   FAILED=$((FAILED+1))

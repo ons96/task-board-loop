@@ -62,7 +62,7 @@ ONCE and retry. Never write tokens to URLs in committed files.
 **Parent issue (large bucket only):**
 ```
 Title: [Epic] <short>
-Labels: status:new, project:<repo>, tag:cross-device, priority:P2, category:epic
+Labels: status:new, project:<repo>, priority:P2, tag:cross-device, category:epic
 Body:
   ## Goal
   <one paragraph spec>
@@ -83,7 +83,7 @@ Body:
 **Child issue:**
 ```
 Title: <action verb> <object>
-Labels: status:new, project:<repo>, tag:github-actions, priority:P2
+Labels: status:new, project:<repo>, priority:P2, tag:github-actions
 Body:
   ## Goal
   <two-line goal, refer to parent #N>
@@ -162,6 +162,8 @@ Before reporting back, verify:
 - [ ] Every issue has `project:<repo>` label.
 - [ ] Every issue has a `tag:<scope>` label (allowed: cross-device,
       device-local, vps-155, gateway-40, github-actions).
+- [ ] Every issue has exactly one canonical `tag:<scope>` label and a
+      `priority:P0`..`priority:P9` label.
 - [ ] Large bucket: parent has `tag:cross-device`, children have
       `tag:github-actions`, children reference parent via `## Parent #N`.
 - [ ] No issue body contains a real secret, token, password, or PII. Scan
