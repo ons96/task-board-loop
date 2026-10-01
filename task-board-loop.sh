@@ -445,6 +445,22 @@ requeue_claim_blocked() {
   unclaim "$n" "$BLOCKED_LABEL"
 }
 
+# Recheck queue eligibility at claim time; an expired recovery gate stays on the
+# issue as evidence until completion, while malformed gates fail closed.
+claimable_issue() {
+  local json="$1" now="$2"
+  echo "$json" | jq -e --arg completed "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" \
+    --arg progress "$IN_PROGRESS_LABEL" --argjson now "$now" '
+    .state == "OPEN" and
+    ([.labels[].name] | index("status:new") != null and index($completed) == null and
+      index($blocked) == null and index($progress) == null and
+      all(.[]; (startswith("locked-by:") | not) and
+        (if startswith("recovery-after:") then
+          (ltrimstr("recovery-after:") | tonumber? // ($now + 1)) <= $now
+         else true end)))
+  ' >/dev/null
+}
+
 # --- model selection + verification (#841) ---
 # pick_model RETRY -> model for this attempt (round-robin over MODELS array)
 pick_model() {
@@ -616,6 +632,13 @@ if [ "$SELF_TEST" = "1" ]; then
   check "missing log classifies as execution failure" test "$(blocked_reason_from_log /nonexistent/no-such-log)" = execution_failed
   check "first recovery uses base cooldown" test "$(recovery_cooldown_after 0)" = "$RECOVERY_COOLDOWN"
   check "recovery backoff scales with attempts" test "$(recovery_cooldown_after 2)" = "$((RECOVERY_COOLDOWN * 3))"
+  local_claim='{"state":"OPEN","labels":[{"name":"status:new"},{"name":"recovery-after:400"}]}'
+  check_not "claim rejects recovery during cooldown" claimable_issue "$local_claim" 399
+  check "claim accepts expired recovery gate" claimable_issue "$local_claim" 400
+  check_not "claim rejects malformed recovery gate" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"recovery-after:bad"}]}' 500
+  check_not "claim rejects another worker lock" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"locked-by:other"}]}' 500
+  check_not "claim rejects in-progress status" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"status:in_progress"}]}' 500
+  check_not "claim rejects closed issue" claimable_issue '{"state":"CLOSED","labels":[{"name":"status:new"}]}' 500
   rm -rf "$taxdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
   # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
@@ -763,10 +786,11 @@ claim() {
   gh label create "$LOCK_LABEL" -R "$TASK_BOARD_REPO" --color "BFD4F2" 2>/dev/null || true
 
   # ponytail #826: pre-check avoids piling a second lock onto a live claim (flap source)
-  local pre
-  pre="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq '[.labels[].name] | join(" ")' 2>/dev/null || echo "")"
-  if [[ "$pre" == *"locked-by:"* ]] || [[ "$pre" != *"status:new"* ]]; then
-    heartbeat "issue #$n already taken (labels: ${pre:-unreadable}), skipping"
+  local pre current now
+  pre="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json state,labels 2>/dev/null)" || return 1
+  now="$(date +%s)"
+  if ! claimable_issue "$pre" "$now"; then
+    heartbeat "issue #$n not eligible for claim, skipping"
     return 1
   fi
 
@@ -779,16 +803,11 @@ claim() {
 
   sleep 2
 
-  local current_lock
-  current_lock=$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq \
-    '[.labels[] | select(.name | startswith("locked-by:")) | .name] | first // ""' 2>/dev/null || echo "")
-
-  if [[ "$current_lock" != "$LOCK_LABEL" ]]; then
-    heartbeat "issue #$n claimed by '${current_lock:-none}' after we tried, releasing"
-    gh issue edit "$n" -R "$TASK_BOARD_REPO" \
-      --remove-label "$IN_PROGRESS_LABEL" \
-      --remove-label "$LOCK_LABEL" \
-      --add-label "status:new" 2>/dev/null || true
+  current="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json state,labels 2>/dev/null)" || return 1
+  if ! echo "$current" | jq -e --arg ours "$LOCK_LABEL" --arg progress "$IN_PROGRESS_LABEL" '
+    .state == "OPEN" and ([.labels[].name | select(startswith("locked-by:"))] == [$ours])
+    and ([.labels[].name] | index($progress) != null)' >/dev/null; then
+    heartbeat "issue #$n claim changed after edit, skipping without changing another lock"
     return 1
   fi
 
