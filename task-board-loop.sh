@@ -385,6 +385,7 @@ issue_attempts() {
 
 set_issue_reason() {
   local n="$1" reason="$2" attempts="$3" label old_labels old
+  owns_claim "$n" || return 1
   label="$(reason_label "$reason")"
   gh label create "$label" -R "$TASK_BOARD_REPO" --color "F9D0C4" 2>/dev/null || true
   gh label create "$(attempts_label "$attempts")" -R "$TASK_BOARD_REPO" --color "D4C5F9" 2>/dev/null || true
@@ -399,6 +400,7 @@ set_issue_reason() {
 
 queue_recovery() {
   local n="$1" prior="$2" cooldown label old
+  owns_claim "$n" || return 1
   cooldown="$(recovery_cooldown_after "$prior")"
   label="recovery-after:$(( $(date +%s) + cooldown ))"
   gh label create "$label" -R "$TASK_BOARD_REPO" --color "C2E0C6" 2>/dev/null || true
@@ -424,6 +426,18 @@ clear_issue_recovery() {
 }
 
 # Release only our own claim, and only if the issue is still in progress with our lock.
+owned_claim_json() {
+  echo "$1" | jq -e --arg ours "$LOCK_LABEL" --arg progress "$IN_PROGRESS_LABEL" '
+    .state == "OPEN" and ([.labels[].name | select(startswith("locked-by:"))] == [$ours])
+    and ([.labels[].name] | index($progress) != null)' >/dev/null
+}
+
+owns_claim() {
+  local state
+  state="$(gh issue view "$1" -R "$TASK_BOARD_REPO" --json state,labels 2>/dev/null)" || return 1
+  owned_claim_json "$state"
+}
+
 requeue_claim() {
   local n="$1" owner_labels state
   state="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json state,labels \
@@ -439,9 +453,7 @@ requeue_claim() {
 requeue_claim_blocked() {
   local n="$1" state
   state="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json state,labels 2>/dev/null)" || return 1
-  echo "$state" | jq -e --arg ours "$LOCK_LABEL" --arg progress "$IN_PROGRESS_LABEL" '
-    .state == "OPEN" and ([.labels[].name | select(startswith("locked-by:"))] == [$ours])
-    and ([.labels[].name] | index($progress) != null)' >/dev/null || return 1
+  owned_claim_json "$state" || return 1
   unclaim "$n" "$BLOCKED_LABEL"
 }
 
@@ -639,6 +651,10 @@ if [ "$SELF_TEST" = "1" ]; then
   check_not "claim rejects another worker lock" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"locked-by:other"}]}' 500
   check_not "claim rejects in-progress status" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"status:in_progress"}]}' 500
   check_not "claim rejects closed issue" claimable_issue '{"state":"CLOSED","labels":[{"name":"status:new"}]}' 500
+  check "owned in-progress claim" owned_claim_json "{\"state\":\"OPEN\",\"labels\":[{\"name\":\"status:in_progress\"},{\"name\":\"$LOCK_LABEL\"}]}"
+  check_not "competing lock prevents metadata updates" owned_claim_json "{\"state\":\"OPEN\",\"labels\":[{\"name\":\"status:in_progress\"},{\"name\":\"$LOCK_LABEL\"},{\"name\":\"locked-by:other\"}]}"
+  check_not "lost lock prevents metadata updates" owned_claim_json '{"state":"OPEN","labels":[{"name":"status:in_progress"},{"name":"locked-by:other"}]}'
+  check_not "closed claim prevents metadata updates" owned_claim_json "{\"state\":\"CLOSED\",\"labels\":[{\"name\":\"status:in_progress\"},{\"name\":\"$LOCK_LABEL\"}]}"
   rm -rf "$taxdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
   # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
@@ -1019,6 +1035,7 @@ resolve_repo_for_issue() {
   # running /work there does wrong-repo work (#830 bug class). Unclaim as blocked instead.
   if [ -n "$proj" ] && [ -z "$hit" ]; then
     heartbeat "project:$proj has no local checkout; refusing fallback repo for #$n"
+    owns_claim "$n" || return 1
     local count
     count="$(issue_attempts "$n")" || count="unknown"
     comment "$n" "task-board-loop: blocked_reason=missing_checkout attempts=$count last_failure_class=missing_checkout; project:$proj has no checkout on $WORKER_ID; refusing launch-repo fallback. Human/operator action required; not requeued."
@@ -1076,6 +1093,7 @@ do_issue() {
   # create or recover worktree (#929: an occupied wt path from a dead run must not block)
   heartbeat "ensuring worktree $wt on branch $branch"
   if ! ensure_worktree "$wt" "$branch"; then
+    owns_claim "$n" || { heartbeat "claim lost for #$n; leaving worktree and issue untouched"; return 1; }
     local wt_reason
     wt_reason="$(worktree_failure_reason "${WORKTREE_ERR:-unknown reason}")"
     local prior_attempts attempts
@@ -1196,6 +1214,7 @@ EOF
   done
 
   # all retries exhausted
+  owns_claim "$n" || { heartbeat "claim lost for #$n; leaving worktree and issue untouched"; stop_heartbeat_poster "$n"; return 1; }
   local log_tail=""
   if [ -f "$logf" ]; then
     log_tail="$(tail -c 4000 "$logf" | tail -12 | sed 's/`/'"'"'/g')"
