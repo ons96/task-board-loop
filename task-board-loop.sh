@@ -730,10 +730,8 @@ mkdir -p "$WORKTREE_DIR"
 
 # Resolve main branch name
 MAIN_BRANCH="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo main)"
-# ponytail: preserve launch values for per-issue fallback (multi-repo task-board)
+# ponytail: launch repo name feeds the pre-claim availability set
 LAUNCH_REPO="$REPO"
-LAUNCH_WORKTREE_DIR="$WORKTREE_DIR"
-LAUNCH_MAIN_BRANCH="$MAIN_BRANCH"
 # ponytail: pre-claim repo-availability set (#830: 155 ran #834 in the wrong repo via launch fallback)
 HAVE_PROJ="$(basename "$LAUNCH_REPO" | tr '[:upper:]' '[:lower:]')"
 if [ -e "$HOME/CodingProjects/.git" ]; then HAVE_PROJ="$HAVE_PROJ,codingprojects"; fi
