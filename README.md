@@ -87,9 +87,20 @@ Worktrees live on each device separately, so no branch collision.
 - `status:new` - work queue (issues must have this + no assignee + no `locked-by:*`)
 - `status:in_progress` - locked (auto-added on claim)
 - `status:done` - completed (auto-added on success)
-- `status:blocked` - needs user (auto-added on failure)
+- `status:blocked` - attempt cannot safely continue (auto-added on failure);
+  carries one `blocked_reason:<value>` label and one `attempts:<n>` label
 
 Priority labels: `priority:P0`..`priority:P9` (used for sort order)
+
+Blocked attempts record a canonical `blocked_reason` class:
+`provider_unavailable`, `transport_timeout`, `worktree_unavailable`, and
+`no_work_product` are transient and may be requeued once per budget
+(`MAX_RECOVERY_REQUEUES`, default 1) after a per-attempt cooldown/backoff
+(`recovery-after:<epoch>` label); `needs_user`, `auth_required`,
+`missing_checkout`, `destructive_request`, `ambiguous_request`, `tests_failed`,
+`worktree_conflict`, and `execution_failed` stay blocked for a human.
+Recovery releases only the recovering worker's own lock, preserves the
+partial worktree, and strips recovery labels once the issue completes.
 
 ## Safety
 
@@ -107,7 +118,7 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 - Non-interactive OpenCode runs prefer `~/.config/opencode/scripts/opencode-resilient.sh`, which retries only classified transient network/provider/transport failures and logs to `~/.local/state/opencode/resilience/`
 - Issues with missing/blocked deps auto-skipped (see opencode `/work` Phase 0)
 - By default, claims pause while the current user has an `opencode` or `omp` process; set `PAUSE_ON_HUMAN=0` only for unattended workers.
-- `--simulate` is safe for local validation: it exercises issue/model selection, the probe payload, and the verification threshold with mocks; it exits before `gh`, `curl`, OpenCode, git, or network setup.
+- `--simulate` is safe for local validation: it exercises issue/model selection, the probe payload, the verification threshold, and #944 recovery routing (per-reason requeue/blocked/cooldown decisions plus a fixture issue list through the real claimable filter) with mocks; it exits before `gh`, `curl`, OpenCode, git, or network setup.
 - Set `SIMULATE_FAIL_FIRST=N` with `--simulate` to force a dead first attempt and verify fallback selection; invalid values fail without external calls.
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
 - Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory of recently probed models; comments and blank lines are ignored. No guessed built-in fallback exists. `FREE_MODEL_ALLOWLIST` remains mandatory for live runs and restricts inventory entries to operator-verified free-tier models.
@@ -122,10 +133,12 @@ Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 | VPS-155 loop | `vps-155`, `gateway-40` | VPS-local and gateway operations |
 | Laptop/manual loop | `device-local` | Laptop-only work |
 
-Every issue should carry exactly one `project:<repo>` label and one canonical
-scope tag: `cross-device`, `github-actions`, `vps-155`, `gateway-40`, or
-`device-local`. Workers never broaden their own scope and never fall back to the
-launch repo for issues pinned to another project.
+At creation time every issue must carry exactly one `project:<repo>` label,
+exactly one `priority:P0`..`priority:P9` label, exactly one `status:new`
+label, and exactly one canonical scope tag: `cross-device`, `github-actions`,
+`vps-155`, `gateway-40`, or `device-local`. Workers never broaden their own
+scope and never fall back to the launch repo for issues pinned to another
+project.
 
 ## Session-close reconciliation
 
