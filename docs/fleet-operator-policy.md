@@ -74,6 +74,16 @@ failure. Retry with bounded exponential backoff and the configured model
 fallbacks. After the retry budget is exhausted, release the claim and skip or
 block with evidence; never spin indefinitely.
 
+Blocked attempts record one canonical `blocked_reason:<value>` label plus a
+cumulative `attempts:<n>` label (see the taxonomy in `AGENTS.md` and
+`README.md`). Only the allowlisted transient reasons
+(`provider_unavailable`, `transport_timeout`, `worktree_unavailable`,
+`no_work_product`) may be automatically requeued, within a bounded recovery
+budget (default one additional attempt) and only after a per-attempt
+cooldown/backoff gate (`recovery-after:<epoch>`). A recovery requeue releases
+only the recovering worker's own lock, preserves the partial worktree, and is
+never applied to a human-blocked reason.
+
 Human-blocked failures are authentication or authorization errors (401/403),
 missing repository or scope access, secret-scan findings, ambiguous
 requirements, repeated verification failure, a required destructive action,

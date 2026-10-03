@@ -106,13 +106,13 @@ blocked_reason_from_log() {
     echo "destructive_request"
   elif [[ "$text" =~ (ambiguous|needs[[:space:]_-]*clarification|clarify[[:space:]_-]*before) ]]; then
     echo "ambiguous_request"
-  elif [[ "$text" =~ (tests?[[:space:]_-]*failed|failing[[:space:]]+tests?|pytest.*(failed|error)|npm[[:space:]]+test.*(failed|error)) ]]; then
+  elif [[ "$text" =~ ((^|[^a-z])tests?[[:space:]_-]*failed|failing[[:space:]]+tests?|pytest.*(failed|error)|npm[[:space:]]+test.*(failed|error)) ]]; then
     echo "tests_failed"
   elif [[ "$text" =~ (no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out) ]]; then
     echo "no_work_product"
   elif [[ "$text" =~ (transport[[:space:]_-]*(timeout|reset|failure)|streaming[[:space:]_-]*abort|mcp[[:space:]_-]*transport) ]]; then
     echo "transport_timeout"
-  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
+  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream|probe[[:space:]]+failed) ]]; then
     echo "provider_unavailable"
   else
     echo "execution_failed"
@@ -147,6 +147,55 @@ worktree_failure_reason() {
     *"git worktree add failed"*|*"branch checked out elsewhere"*) echo worktree_unavailable ;;
     *) echo worktree_conflict ;;
   esac
+}
+
+# repo_available proj -> 0 if this device has the matching checkout
+repo_available() {
+  local p
+  p="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [ -z "$p" ] && return 1
+  [[ ",$HAVE_PROJ," == *",$p,"* ]] && return 0
+  return 1
+}
+
+# scope_allowed SCOPE -> 0 when this worker is configured for the scope.
+# Untagged issues are cross-device by convention and stay with GH Actions.
+scope_allowed() {
+  local scope="${1:-cross-device}" allowed
+  IFS=',' read -ra allowed_scopes <<< "$TASK_ALLOWED_SCOPES"
+  for allowed in "${allowed_scopes[@]}"; do
+    allowed="$(echo "$allowed" | xargs)"
+    [ "$allowed" = "$scope" ] && return 0
+  done
+  return 1
+}
+
+# gates_expired GATES NOW -> 0 iff every comma-separated recovery-after epoch is
+# numeric and already expired (<= now). Malformed or future gates fail closed,
+# matching claimable_issue: an unreadable gate must never requeue early.
+gates_expired() {
+  local gates="${1:-}" now="$2" g
+  [ -z "$gates" ] && return 0
+  local IFS=','
+  for g in $gates; do
+    [[ "$g" =~ ^[0-9]+$ ]] || return 1
+    [ "$g" -le "$now" ] || return 1
+  done
+  return 0
+}
+
+# pick_claimable [NOW]: read "num project-label scope [recovery-gates]" lines,
+# echo first eligible issue. NOW defaults to the current epoch; fixtures pass it
+# so cooldown gates stay deterministic offline.
+pick_claimable() {
+  local now="${1:-$(date +%s)}" num pl scope gates
+  while read -r num pl scope gates; do
+    [ -n "$num" ] || continue
+    gates_expired "$gates" "$now" || continue
+    scope_allowed "$scope" || continue
+    if repo_available "${pl#project:}"; then echo "$num"; return 0; fi
+  done
+  return 1
 }
 
 # Simulation exits before env loading, filesystem setup, gh, curl, OpenCode, or git.
@@ -209,12 +258,37 @@ not-a-reason|0|1|0|100|500|300|blocked"
   [ "$(worktree_failure_reason 'git worktree add failed for branch work/9')" = worktree_unavailable ] || \
     { echo "simulation: FAIL recoverable worktree must requeue" >&2; sim_recovery_fail=1; }
   [ "$sim_recovery_fail" = "0" ] || exit 1
+  # #944: fixture issue-list dry run - the real claimable filter (scope, checkout,
+  # recovery gates) runs against fixture rows with a fixed clock; no gh mutation.
+  TASK_ALLOWED_SCOPES="cross-device,github-actions"
+  HAVE_PROJ="task-board-loop"
+  # Fields: number|project|scope|gates|expected_pick
+  sim_list_fixtures="101|project:task-board-loop|cross-device||101
+102|project:task-board-loop|cross-device|400|102
+103|project:task-board-loop|cross-device|999999999999|
+104|project:task-board-loop|cross-device|tomorrow|
+105|project:task-board-loop|cross-device|400,501|
+106|project:task-board-loop|vps-155||
+107|project:missing-repo|cross-device||"
+  sim_list_total=0
+  while IFS='|' read -r sim_n sim_pl sim_scope sim_gates sim_expect; do
+    [ -n "${sim_n:-}" ] || continue
+    sim_list_total=$((sim_list_total + 1))
+    sim_line="$sim_n $sim_pl $sim_scope"
+    [ -n "$sim_gates" ] && sim_line="$sim_line $sim_gates"
+    sim_pick="$(printf '%s\n' "$sim_line" | pick_claimable 500 || true)"
+    if [ "$sim_pick" != "$sim_expect" ]; then
+      echo "simulation: FAIL list fixture #$sim_n -> '${sim_pick:-<none>}' (want '${sim_expect:-<none>}')" >&2
+      sim_recovery_fail=1
+    fi
+  done <<< "$sim_list_fixtures"
+  [ "$sim_recovery_fail" = "0" ] || exit 1
   if [ "$sim_fail_first" -gt 0 ]; then
-    printf 'simulation: PASS\nissue_selected: #%s\nfailed_attempts: %s (forced dead)\nfallback_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nrecovery_fixtures: %s pass (requeue/blocked/cooldown routing, no live mutation)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
-      "$sim_selected" "$sim_attempt0" "$sim_next_model" "$sim_payload" "$sim_log_size" "$sim_recovery_total"
+    printf 'simulation: PASS\nissue_selected: #%s\nfailed_attempts: %s (forced dead)\nfallback_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nrecovery_fixtures: %s pass (requeue/blocked/cooldown routing, no live mutation)\nissue_list_fixtures: %s pass (scope/checkout/recovery-gate routing, no live mutation)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_next_model" "$sim_payload" "$sim_log_size" "$sim_recovery_total" "$sim_list_total"
   else
-    printf 'simulation: PASS\nissue_selected: #%s\nattempt_0_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nrecovery_fixtures: %s pass (requeue/blocked/cooldown routing, no live mutation)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
-      "$sim_selected" "$sim_attempt0" "$sim_payload" "$sim_log_size" "$sim_recovery_total"
+    printf 'simulation: PASS\nissue_selected: #%s\nattempt_0_model: %s\nprobe_payload: %s\nverify_gate: PASS (mock dirty worktree + %s-byte log)\nrecovery_fixtures: %s pass (requeue/blocked/cooldown routing, no live mutation)\nissue_list_fixtures: %s pass (scope/checkout/recovery-gate routing, no live mutation)\nside_effects: none (no gh/curl/opencode/git/network)\n' \
+      "$sim_selected" "$sim_attempt0" "$sim_payload" "$sim_log_size" "$sim_recovery_total" "$sim_list_total"
   fi
   exit 0
 fi
@@ -319,27 +393,6 @@ LAST_SWEEP=0
 # stale_by_ttl now last_live ttl -> 0 (stale) if now-last_live >= ttl, else 1
 stale_by_ttl() { [ "$1" -ge "$(( $2 + $3 ))" ]; }
 
-# repo_available proj -> 0 if this device has the matching checkout
-repo_available() {
-  local p
-  p="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
-  [ -z "$p" ] && return 1
-  [[ ",$HAVE_PROJ," == *",$p,"* ]] && return 0
-  return 1
-}
-
-# scope_allowed SCOPE -> 0 when this worker is configured for the scope.
-# Untagged issues are cross-device by convention and stay with GH Actions.
-scope_allowed() {
-  local scope="${1:-cross-device}" allowed
-  IFS=',' read -ra allowed_scopes <<< "$TASK_ALLOWED_SCOPES"
-  for allowed in "${allowed_scopes[@]}"; do
-    allowed="$(echo "$allowed" | xargs)"
-    [ "$allowed" = "$scope" ] && return 0
-  done
-  return 1
-}
-
 # find_checkout ROOT proj -> echo checkout dir under ROOT matching proj (case-insensitive), else 1
 # ponytail: linear dir scan instead of -d test so label case mismatches resolve (project:llm-api-key-proxy -> LLM-API-Key-Proxy)
 find_checkout() {
@@ -348,17 +401,6 @@ find_checkout() {
   for d in "$root"/*/; do
     [ -e "${d}.git" ] || continue
     if [ "$(basename "$d" | tr '[:upper:]' '[:lower:]')" = "$p" ]; then echo "${d%/}"; return 0; fi
-  done
-  return 1
-}
-
-# pick_claimable: read "num project-label scope" lines, echo first eligible issue.
-pick_claimable() {
-  local num pl scope
-  while read -r num pl scope; do
-    [ -n "$num" ] || continue
-    scope_allowed "$scope" || continue
-    if repo_available "${pl#project:}"; then echo "$num"; return 0; fi
   done
   return 1
 }
@@ -579,6 +621,17 @@ if [ "$SELF_TEST" = "1" ]; then
   [ "$(printf '9 project:task-board-loop cross-device\n' | pick_claimable)" = "9" ] && echo "ok: runner claims cross-device issue" || { echo "FAIL: runner skipped cross-device issue"; fails=$((fails+1)); }
   [ -z "$(printf '10 project:task-board-loop vps-155\n' | pick_claimable)" ] && echo "ok: runner skips VPS issue" || { echo "FAIL: runner claimed VPS issue"; fails=$((fails+1)); }
   [ "$(printf '11 project:task-board-loop\n' | pick_claimable)" = "11" ] && echo "ok: untagged issue defaults to cross-device" || { echo "FAIL: untagged issue routing"; fails=$((fails+1)); }
+  # #944: recovery gates ride on pick_claimable; malformed/future gates fail closed.
+  [ "$(printf '12 project:task-board-loop cross-device 400\n' | pick_claimable 500)" = "12" ] && echo "ok: expired recovery gate is claimable" || { echo "FAIL: expired recovery gate claim"; fails=$((fails+1)); }
+  [ -z "$(printf '13 project:task-board-loop cross-device 999999999999\n' | pick_claimable 500)" ] && echo "ok: active recovery gate skipped at list time" || { echo "FAIL: active recovery gate claimed"; fails=$((fails+1)); }
+  [ -z "$(printf '14 project:task-board-loop cross-device tomorrow\n' | pick_claimable 500)" ] && echo "ok: malformed recovery gate skipped at list time" || { echo "FAIL: malformed recovery gate claimed"; fails=$((fails+1)); }
+  [ "$(printf '15 project:task-board-loop cross-device 400,500\n' | pick_claimable 500)" = "15" ] && echo "ok: all-expired gates claimable" || { echo "FAIL: all-expired gates claim"; fails=$((fails+1)); }
+  [ -z "$(printf '16 project:task-board-loop cross-device 400,501\n' | pick_claimable 500)" ] && echo "ok: one future gate among many blocks claim" || { echo "FAIL: mixed gates claim"; fails=$((fails+1)); }
+  check "no gates is expired" gates_expired "" 500
+  check "gate at exactly now is expired" gates_expired "500" 500
+  check_not "gate after now is active" gates_expired "501" 500
+  check_not "non-numeric gate fails closed" gates_expired "tomorrow" 500
+  check_not "mixed numeric gate fails on active one" gates_expired "400,501" 500
   ckdir="$(mktemp -d /tmp/cktest.XXXXXX)"
   mkdir -p "$ckdir/LLM-API-Key-Proxy/.git" "$ckdir/noext"
   check "find_checkout resolves case-insensitively" find_checkout "$ckdir" "llm-api-key-proxy"
@@ -602,6 +655,8 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'missing credentials\n' > "$taxdir/credentials"
   printf 'needs-user decision required\n' > "$taxdir/needs-user"
   printf 'shell exited unexpectedly\n' > "$taxdir/execution"
+  printf 'gateway probe failed for model=vps-gateway/coding-fast (cause unknown)\n' > "$taxdir/probe"
+  printf 'the latest failed CI run had no other errors\n' > "$taxdir/latest-failed"
   [ "$(blocked_reason_from_log "$taxdir/auth")" = "auth_required" ] && echo "ok: auth taxonomy" || { echo "FAIL: auth taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/destructive")" = "destructive_request" ] && echo "ok: destructive taxonomy" || { echo "FAIL: destructive taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/ambiguous")" = "ambiguous_request" ] && echo "ok: ambiguous taxonomy" || { echo "FAIL: ambiguous taxonomy"; fails=$((fails+1)); }
@@ -616,6 +671,8 @@ if [ "$SELF_TEST" = "1" ]; then
   [ "$(blocked_reason_from_log "$taxdir/credentials")" = "needs_user" ] && echo "ok: credential taxonomy" || { echo "FAIL: credential taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/needs-user")" = "needs_user" ] && echo "ok: needs-user taxonomy" || { echo "FAIL: needs-user taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/execution")" = "execution_failed" ] && echo "ok: execution taxonomy" || { echo "FAIL: execution taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/probe")" = "provider_unavailable" ] && echo "ok: dead gateway probe is provider-unavailable" || { echo "FAIL: dead gateway probe taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/latest-failed")" = "execution_failed" ] && echo "ok: latest-failed wording is not a test failure" || { echo "FAIL: latest-failed false positive"; fails=$((fails+1)); }
   check "provider failures requeue" reason_is_requeueable provider_unavailable
   check "no-work retries requeue" reason_is_requeueable no_work_product
   check "transport failures requeue" reason_is_requeueable transport_timeout
@@ -780,11 +837,12 @@ next_issue() {
     json="$(gh issue list -R "$TASK_BOARD_REPO" --label "$l1" --state open --json number,labels --limit 100)"
   fi
   # ponytail: first candidate in this worker's scope whose repo exists locally wins
-  echo "$json" | jq -r --arg done "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" --argjson now "$(date +%s)" '
+  # recovery-after gates ride along as a 4th column; pick_claimable fails closed
+  # on future or malformed gates (claim() re-checks via claimable_issue).
+  echo "$json" | jq -r --arg done "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" '
       .[]
       | select((.labels | map(.name) | any(. == $done or . == $blocked or startswith("locked-by:"))) | not)
-       | select((.labels | map(.name) | map(select(startswith("recovery-after:")) | sub("^recovery-after:"; "") | tonumber? | select(. == null or . > $now)) | length) == 0)
-      | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "") \(.labels | map(.name) | map(select(startswith("tag:")) | sub("^tag:"; "") | select(. == "cross-device" or . == "device-local" or . == "vps-155" or . == "gateway-40" or . == "github-actions")) | .[0] // "cross-device")"
+      | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "") \(.labels | map(.name) | map(select(startswith("tag:")) | sub("^tag:"; "") | select(. == "cross-device" or . == "device-local" or . == "vps-155" or . == "gateway-40" or . == "github-actions")) | .[0] // "cross-device") \(.labels | map(.name) | map(select(startswith("recovery-after:")) | sub("^recovery-after:"; "")) | join(","))"
     ' | pick_claimable || true
 }
 
