@@ -440,6 +440,15 @@ set_issue_reason() {
   gh issue edit "$n" -R "$TASK_BOARD_REPO" "${args[@]}" 2>/dev/null
 }
 
+# --- release lock + transition to terminal label ---
+unclaim() {
+  local n="$1" label="$2"  # label = $DONE_LABEL | $BLOCKED_LABEL
+  gh issue edit "$n" -R "$TASK_BOARD_REPO" \
+    --remove-label "$IN_PROGRESS_LABEL" \
+    --remove-label "$LOCK_LABEL" \
+    --add-label "$label" 2>/dev/null || true
+}
+
 queue_recovery() {
   local n="$1" prior="$2" cooldown label old
   owns_claim "$n" || return 1
@@ -713,6 +722,122 @@ if [ "$SELF_TEST" = "1" ]; then
   check_not "lost lock prevents metadata updates" owned_claim_json '{"state":"OPEN","labels":[{"name":"status:in_progress"},{"name":"locked-by:other"}]}'
   check_not "closed claim prevents metadata updates" owned_claim_json "{\"state\":\"CLOSED\",\"labels\":[{\"name\":\"status:in_progress\"},{\"name\":\"$LOCK_LABEL\"}]}"
   rm -rf "$taxdir"
+  # #944: live-path fixtures - real set_issue_reason/queue_recovery/requeue_claim
+  # running against an offline gh() shim (state in $ghdir JSON files), so the
+  # label-mutation sequence each decision class drives is verified without network.
+  ghdir="$(mktemp -d /tmp/ghmock.XXXXXX)"
+  gh() {
+    # offline gh shim: label create succeeds; issue view/edit/comment mutate state files
+    if [ "${1:-}" = label ]; then return 0; fi
+    [ "${1:-}" = issue ] || return 1
+    local verb="$2" n="" filter="" body="" l f
+    local -a adds=() removes=()
+    shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -R|--json|--color|--state|--limit|--label) shift 2 ;;
+        --jq) filter="$2"; shift 2 ;;
+        --add-label) adds+=("$2"); shift 2 ;;
+        --remove-label) removes+=("$2"); shift 2 ;;
+        --body) body="$2"; shift 2 ;;
+        *) n="$1"; shift ;;
+      esac
+    done
+    f="$ghdir/issue-$n.json"
+    case "$verb" in
+      view)
+        [ -f "$f" ] || return 1
+        if [ -n "$filter" ]; then jq -r "$filter" "$f"; else jq -c '.' "$f"; fi
+        ;;
+      edit)
+        [ -f "$f" ] || return 1
+        for l in "${adds[@]}"; do
+          jq --arg l "$l" '.labels |= (if any(.[]; .name == $l) then . else . + [{"name":$l}] end)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+        done
+        for l in "${removes[@]}"; do
+          jq --arg l "$l" '.labels |= [.[] | select(.name != $l)]' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+        done
+        ;;
+      comment)
+        [ -f "$f" ] || return 1
+        jq --arg b "$body" '.comments += [$b]' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  ghmock_seed() { local n="$1"; shift; printf '%s\n' "$@" | jq -R . | jq -sc '{state:"OPEN",labels:[.[] | {name:.}]}' > "$ghdir/issue-$n.json"; }
+  ghmock_seed_closed() { local n="$1"; shift; printf '%s\n' "$@" | jq -R . | jq -sc '{state:"CLOSED",labels:[.[] | {name:.}]}' > "$ghdir/issue-$n.json"; }
+  ghmock_has() { jq -e --arg l "$2" 'any(.labels[]; .name == $l)' "$ghdir/issue-$1.json" >/dev/null 2>&1; }
+  ghmock_count() { jq --arg p "$2" '[.labels[] | select(.name | startswith($p))] | length' "$ghdir/issue-$1.json"; }
+  ghmock_gate() { jq -r --arg p 'recovery-after:' 'first(.labels[].name | select(startswith($p)) | ltrimstr($p)) // ""' "$ghdir/issue-$1.json"; }
+  ghmock_state() { cat "$ghdir/issue-$1.json"; }
+  # A: transient failure -> one bounded recovery requeue behind a cooldown gate
+  ghmock_seed 201 "status:in_progress" "$LOCK_LABEL"
+  check "issue_attempts reads 0 on fresh claim" test "$(issue_attempts 201)" = 0
+  check "owned claim records metadata" set_issue_reason 201 provider_unavailable 1
+  check "exactly one blocked_reason label" test "$(ghmock_count 201 'blocked_reason:')" = 1
+  check "exactly one attempts label" test "$(ghmock_count 201 'attempts:')" = 1
+  check "attempts label carries count" ghmock_has 201 "attempts:1"
+  check "queue bounded recovery" queue_recovery 201 0
+  gate="$(ghmock_gate 201)"
+  check "recovery gate epoch is numeric" test "$gate" -ne 0
+  check "gate is in the future (cooldown)" test "$gate" -gt "$(date +%s)"
+  check "exactly one recovery gate" test "$(ghmock_count 201 'recovery-after:')" = 1
+  check_not "second recovery queue refused (idempotent)" queue_recovery 201 0
+  check "still exactly one recovery gate" test "$(ghmock_count 201 'recovery-after:')" = 1
+  check "requeue released our lock" test "$(ghmock_count 201 'locked-by:')" = 0
+  check_not "requeue removed in-progress" ghmock_has 201 "status:in_progress"
+  check "requeue returned to status:new" ghmock_has 201 "status:new"
+  check_not "gate active: not claimable yet" claimable_issue "$(ghmock_state 201)" "$((gate - 1))"
+  check "gate expired: claimable again" claimable_issue "$(ghmock_state 201)" "$gate"
+  # second exhausted attempt: metadata swaps, repeated transient stays terminal
+  gh issue edit 201 -R "$TASK_BOARD_REPO" --add-label "status:in_progress" --add-label "$LOCK_LABEL" --remove-label "status:new"
+  check "second attempt swaps metadata" set_issue_reason 201 provider_unavailable 2
+  check "still one blocked_reason after swap" test "$(ghmock_count 201 'blocked_reason:')" = 1
+  check "still one attempts label after swap" test "$(ghmock_count 201 'attempts:')" = 1
+  check "attempts bumped to 2" ghmock_has 201 "attempts:2"
+  check_not "repeated transient failure stays blocked" test "$(recovery_decision provider_unavailable 1 "$MAX_RECOVERY_REQUEUES" 0)" = requeue
+  check "terminal block on repeated failure" requeue_claim_blocked 201
+  check "blocked label applied" ghmock_has 201 "status:blocked"
+  check "no lock after terminal block" test "$(ghmock_count 201 'locked-by:')" = 0
+  check_not "blocked issue is not claimable" claimable_issue "$(ghmock_state 201)" "$gate"
+  # B: human-blocked reason never requeues, stays terminally blocked
+  ghmock_seed 203 "status:in_progress" "$LOCK_LABEL"
+  check "needs-user metadata recorded" set_issue_reason 203 needs_user 1
+  check_not "needs-user never requeues" test "$(recovery_decision needs_user 0 "$MAX_RECOVERY_REQUEUES" 0)" = requeue
+  check "terminal block for needs-user" requeue_claim_blocked 203
+  check "no recovery gate for needs-user" test "$(ghmock_count 203 'recovery-after:')" = 0
+  check "needs-user metadata survives as evidence" ghmock_has 203 "blocked_reason:needs_user"
+  # C: foreign or stolen locks are never mutated by another worker
+  ghmock_seed 205 "status:in_progress" "locked-by:other-worker"
+  check_not "foreign claim refuses metadata" set_issue_reason 205 provider_unavailable 1
+  check_not "foreign claim refuses recovery queue" queue_recovery 205 0
+  check_not "foreign claim refuses requeue" requeue_claim 205
+  check_not "foreign claim refuses blocked transition" requeue_claim_blocked 205
+  check "foreign issue untouched" test "$(jq -r '.labels | map(.name) | join(",")' "$ghdir/issue-205.json")" = "status:in_progress,locked-by:other-worker"
+  ghmock_seed 206 "status:in_progress" "$LOCK_LABEL"
+  gh issue edit 206 -R "$TASK_BOARD_REPO" --remove-label "$LOCK_LABEL" --add-label "locked-by:other-worker"
+  check_not "stolen lock refuses metadata" set_issue_reason 206 provider_unavailable 1
+  check_not "stolen lock refuses recovery" queue_recovery 206 0
+  check "no gate added to stolen lock" test "$(ghmock_count 206 'recovery-after:')" = 0
+  # D: closed issues are never mutated
+  ghmock_seed_closed 207 "status:in_progress" "$LOCK_LABEL"
+  check_not "closed issue refuses metadata" set_issue_reason 207 provider_unavailable 1
+  check_not "closed issue refuses recovery" queue_recovery 207 0
+  check_not "closed issue refuses requeue" requeue_claim 207
+  check_not "closed issue refuses blocked transition" requeue_claim_blocked 207
+  # E: completion strips blocked metadata and gates
+  ghmock_seed 208 "status:in_progress" "$LOCK_LABEL" "blocked_reason:provider_unavailable" "attempts:2" "recovery-after:1"
+  check "clear strips blocked metadata" clear_issue_recovery 208
+  check "no blocked_reason after clear" test "$(ghmock_count 208 'blocked_reason:')" = 0
+  check "no attempts after clear" test "$(ghmock_count 208 'attempts:')" = 0
+  check "no gates after clear" test "$(ghmock_count 208 'recovery-after:')" = 0
+  check "claim state labels survive clear" ghmock_has 208 "$LOCK_LABEL"
+  # ambiguous attempts labels fail closed
+  ghmock_seed 209 "status:in_progress" "$LOCK_LABEL" "attempts:1" "attempts:2"
+  check_not "ambiguous attempts label fails closed" issue_attempts 209
+  unset -f gh ghmock_seed ghmock_seed_closed ghmock_has ghmock_count ghmock_gate ghmock_state
+  rm -rf "$ghdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
   # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
   MIN_LOG_BYTES=200
@@ -885,15 +1010,6 @@ claim() {
 
   comment "$n" "Claimed by \`${WORKER_ID}\` at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   return 0
-}
-
-# --- release lock + transition to terminal label ---
-unclaim() {
-  local n="$1" label="$2"  # label = $DONE_LABEL | $BLOCKED_LABEL
-  gh issue edit "$n" -R "$TASK_BOARD_REPO" \
-    --remove-label "$IN_PROGRESS_LABEL" \
-    --remove-label "$LOCK_LABEL" \
-    --add-label "$label" 2>/dev/null || true
 }
 
 # --- stale-lock TTL sweep (#826) ---
