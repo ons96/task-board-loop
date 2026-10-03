@@ -508,6 +508,21 @@ requeue_claim_blocked() {
   unclaim "$n" "$BLOCKED_LABEL"
 }
 
+# Terminal block for an unresolvable project checkout (#930/#944): record
+# blocked_reason=missing_checkout with the cumulative attempt count, comment
+# the evidence, and release only our own claim to status:blocked. Human/operator
+# reason: never requeued.
+block_missing_checkout() {
+  local n="$1" proj="$2" count
+  owns_claim "$n" || return 1
+  count="$(issue_attempts "$n")" || count="unknown"
+  # cumulative count names the attempt that just failed, like the other blocked paths
+  [ "$count" = unknown ] || count=$((count + 1))
+  comment "$n" "task-board-loop: blocked_reason=missing_checkout attempts=$count last_failure_class=missing_checkout; project:$proj has no checkout on $WORKER_ID; refusing launch-repo fallback. Human/operator action required; not requeued."
+  [ "$count" = unknown ] || set_issue_reason "$n" missing_checkout "$count" || true
+  unclaim "$n" "$BLOCKED_LABEL"
+}
+
 # Recheck queue eligibility at claim time; an expired recovery gate stays on the
 # issue as evidence until completion, while malformed gates fail closed.
 claimable_issue() {
@@ -836,6 +851,27 @@ if [ "$SELF_TEST" = "1" ]; then
   # ambiguous attempts labels fail closed
   ghmock_seed 209 "status:in_progress" "$LOCK_LABEL" "attempts:1" "attempts:2"
   check_not "ambiguous attempts label fails closed" issue_attempts 209
+  # F: missing-checkout block is terminal with cumulative attempt metadata
+  # (heartbeat/comment are defined later in the live path; stub them for the fixture)
+  heartbeat() { :; }
+  comment() { printf '%s\n' "$2" >> "$ghdir/comments.txt"; }
+  ghmock_seed 210 "status:in_progress" "$LOCK_LABEL" "project:no-such-repo"
+  check "missing checkout blocks the issue" block_missing_checkout 210 "no-such-repo"
+  check "missing checkout records reason metadata" ghmock_has 210 "blocked_reason:missing_checkout"
+  check "missing checkout records cumulative attempt" ghmock_has 210 "attempts:1"
+  check "missing checkout comment carries evidence" grep -qF "blocked_reason=missing_checkout attempts=1 last_failure_class=missing_checkout" "$ghdir/comments.txt"
+  check "missing checkout stays terminally blocked" ghmock_has 210 "status:blocked"
+  check_not "missing checkout leaves no lock" ghmock_has 210 "$LOCK_LABEL"
+  check_not "blocked missing checkout is not claimable" claimable_issue "$(ghmock_state 210)" 500
+  check "no recovery gate for missing checkout" test "$(ghmock_count 210 'recovery-after:')" = 0
+  ghmock_seed 211 "status:in_progress" "$LOCK_LABEL" "project:no-such-repo" "attempts:2"
+  check "recovered issue missing checkout blocks again" block_missing_checkout 211 "no-such-repo"
+  check "prior attempts counted cumulatively" ghmock_has 211 "attempts:3"
+  check "attempts label swapped not stacked" test "$(ghmock_count 211 'attempts:')" = 1
+  ghmock_seed 212 "status:in_progress" "locked-by:other-worker" "project:no-such-repo"
+  check_not "foreign claim refuses missing-checkout block" block_missing_checkout 212 "no-such-repo"
+  check "foreign issue untouched by missing-checkout block" test "$(jq -r '.labels | map(.name) | join(",")' "$ghdir/issue-212.json")" = "status:in_progress,locked-by:other-worker,project:no-such-repo"
+  unset -f comment heartbeat
   unset -f gh ghmock_seed ghmock_seed_closed ghmock_has ghmock_count ghmock_gate ghmock_state
   rm -rf "$ghdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
@@ -1207,12 +1243,7 @@ resolve_repo_for_issue() {
   # running /work there does wrong-repo work (#830 bug class). Unclaim as blocked instead.
   if [ -n "$proj" ] && [ -z "$hit" ]; then
     heartbeat "project:$proj has no local checkout; refusing fallback repo for #$n"
-    owns_claim "$n" || return 1
-    local count
-    count="$(issue_attempts "$n")" || count="unknown"
-    comment "$n" "task-board-loop: blocked_reason=missing_checkout attempts=$count last_failure_class=missing_checkout; project:$proj has no checkout on $WORKER_ID; refusing launch-repo fallback. Human/operator action required; not requeued."
-    [ "$count" = unknown ] || set_issue_reason "$n" missing_checkout "$count" || true
-    unclaim "$n" "$BLOCKED_LABEL"
+    block_missing_checkout "$n" "$proj" || return 1
     BLOCKED=$((BLOCKED+1))
     return 1
   fi
