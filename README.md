@@ -118,7 +118,7 @@ partial worktree, and strips recovery labels once the issue completes.
 - Non-interactive OpenCode runs prefer `~/.config/opencode/scripts/opencode-resilient.sh`, which retries only classified transient network/provider/transport failures and logs to `~/.local/state/opencode/resilience/`
 - Issues with missing/blocked deps auto-skipped (see opencode `/work` Phase 0)
 - By default, claims pause while the current user has an `opencode` or `omp` process; set `PAUSE_ON_HUMAN=0` only for unattended workers.
-- `--simulate` is safe for local validation: it exercises issue/model selection, the probe payload, and the verification threshold with mocks; it exits before `gh`, `curl`, OpenCode, git, or network setup.
+- `--simulate` is safe for local validation: it exercises issue/model selection, the probe payload, the verification threshold, and #944 recovery routing (per-reason requeue/blocked/cooldown decisions plus a fixture issue list through the real claimable filter) with mocks; it exits before `gh`, `curl`, OpenCode, git, or network setup.
 - Set `SIMULATE_FAIL_FIRST=N` with `--simulate` to force a dead first attempt and verify fallback selection; invalid values fail without external calls.
 - Active runs default to CPU niceness 10 and idle I/O priority; set `OPENCODE_NICE`, `OPENCODE_IONICE`, and optional `OPENCODE_MEMORY_MAX_MB` to tune resource limits.
 - Set `OPENCODE_MODEL_CHAIN_FILE` to a plain-text, one-model-per-line inventory of recently probed models; comments and blank lines are ignored. No guessed built-in fallback exists. `FREE_MODEL_ALLOWLIST` remains mandatory for live runs and restricts inventory entries to operator-verified free-tier models.
