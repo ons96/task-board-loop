@@ -7,7 +7,9 @@
 # - Recovers occupied worktree paths: a stale wt dir from a dead run is reused or
 #   adopted (uncommitted leftovers kept, never force-removed), not a blocker (#929)
 # - Posts heartbeat comments so watchdog.sh detects liveness
-# - Marks status:blocked + comment if /work can't proceed
+# - Marks status:blocked + blocked_reason/attempts labels + comment if /work
+#   can't proceed; allowlisted transient reasons get one bounded recovery
+#   requeue to status:new behind a recovery-after:<epoch> cooldown gate (#944)
 # - Health: writes last-heartbeat to $HEARTBEAT_FILE for systemd watchdog timer
 #
 # Usage:

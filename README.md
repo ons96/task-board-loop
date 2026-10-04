@@ -73,7 +73,9 @@ Notes:
 3. Creates git worktree `../worktrees/wt-N` on branch `work/N`
 4. Runs local resilient OpenCode wrapper when installed, otherwise `opencode /work N` (30 min timeout, 2 retries)
 5. PR via `gh`, comment on issue with result
-6. Marks `status:done` on success, `status:blocked` on failure
+6. Marks `status:done` on success; on failure `status:blocked` — except allowlisted
+   transient `blocked_reason` classes, which get one bounded recovery requeue back to
+   `status:new` behind a `recovery-after:<epoch>` cooldown gate
 7. Loops
 
 ## Coordination across devices
