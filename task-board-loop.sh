@@ -44,6 +44,10 @@
 #   IDLE_SLEEP        seconds to wait when no work (default: 60)
 #   OPENCODE_TIMEOUT  max seconds per /work (default: 1800 = 30min)
 #   MAX_RETRIES       per-issue retry count on transient failure (default: 2)
+#   MAX_RECOVERY_REQUEUES bounded recovery requeues per issue after exhausted
+#                      attempts, allowlisted transient blocked_reasons only (default: 1)
+#   RECOVERY_COOLDOWN base seconds per recovery-after gate; scales linearly
+#                      with prior attempts (default: 300)
 #   OPENCODE_MODEL_CHAIN comma-separated opencode model ids; retry advances to next (default below)
 #   FREE_MODEL_ALLOWLIST comma-separated models with current verified-free evidence; required for live runs
 #   OPENCODE_MODEL    if set, prepended to the chain as first choice
