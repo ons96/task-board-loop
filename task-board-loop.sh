@@ -285,6 +285,16 @@ blocked_reason_from_log() {
     echo "ambiguous_request"
   elif [[ "$text" =~ (pytest|npm[[:space:]]+test|test[[:space:]]+failed|failing[[:space:]]+test) ]]; then
     echo "tests_failed"
+  elif [[ "$text" =~ (needs-user|human[[:space:]_-]*required|operator[[:space:]_-]*action|manual[[:space:]_-]*step|approval[[:space:]_-]*required) ]]; then
+    echo "needs_user"
+  elif [[ "$text" =~ (missing[[:space:]_-]*checkout|clone[[:space:]_-]*failed|repository[[:space:]]+not[[:space:]]+found|worktree[[:space:]_-]*not[[:space:]_-]*found|no[[:space:]]+such[[:space:]]+checkout) ]]; then
+    echo "missing_checkout"
+  elif [[ "$text" =~ (worktree[[:space:]_-]*already|already[[:space:]_-]*a[[:space:]_-]*worktree|branch[[:space:]_-]*already[[:space:]_-]*exists|already[[:space:]_-]*locked) ]]; then
+    echo "occupied_worktree"
+  elif [[ "$text" =~ (nothing[[:space:]]+to[[:space:]]+commit|no[[:space:]]+changes|empty[[:space:]]+diff|no[[:space:]]+work[[:space:]]+product) ]]; then
+    echo "no_work_product"
+  elif [[ "$text" =~ (opencode[[:space:]_-]*timed?[[:space:]_-]*out|command[[:space:]]+timed[[:space:]]+out|killed[[:space:]]+by[[:space:]]+timeout|timeout[[:space:]]+after[[:space:]]+[0-9]+s) ]]; then
+    echo "runner_timeout"
   elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream) ]]; then
     echo "provider_unavailable"
   else
@@ -294,9 +304,18 @@ blocked_reason_from_log() {
 
 reason_is_requeueable() {
   case "${1:-}" in
-    provider_unavailable|transport_timeout) return 0 ;;
+    provider_unavailable|transport_timeout|runner_timeout) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+final_reason() {
+  local reason="${1:-}" prior="${2:-0}"
+  if [ "$prior" -ge "${MAX_RECOVERY_REQUEUES:-3}" ] 2>/dev/null && reason_is_requeueable "$reason"; then
+    echo "repeated_failure"
+  else
+    echo "$reason"
+  fi
 }
 
 reason_label() { echo "${BLOCKED_REASON_PREFIX}${1}"; }
@@ -445,16 +464,32 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'pytest test failed\n' > "$taxdir/tests"
   printf 'upstream timeout HTTP 503\n' > "$taxdir/provider"
   printf 'shell exited unexpectedly\n' > "$taxdir/execution"
+  printf 'needs-user manual step required\n' > "$taxdir/needsuser"
+  printf 'clone failed repository not found\n' > "$taxdir/checkout"
+  printf 'worktree already locked\n' > "$taxdir/occupied"
+  printf 'nothing to commit, empty diff\n' > "$taxdir/nowork"
+  printf 'opencode timed out after 600s\n' > "$taxdir/runner"
   [ "$(blocked_reason_from_log "$taxdir/auth")" = "auth_required" ] && echo "ok: auth taxonomy" || { echo "FAIL: auth taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/destructive")" = "destructive_request" ] && echo "ok: destructive taxonomy" || { echo "FAIL: destructive taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/ambiguous")" = "ambiguous_request" ] && echo "ok: ambiguous taxonomy" || { echo "FAIL: ambiguous taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/tests")" = "tests_failed" ] && echo "ok: tests taxonomy" || { echo "FAIL: tests taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/provider")" = "provider_unavailable" ] && echo "ok: provider taxonomy" || { echo "FAIL: provider taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/execution")" = "execution_failed" ] && echo "ok: execution taxonomy" || { echo "FAIL: execution taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/needsuser")" = "needs_user" ] && echo "ok: needsuser taxonomy" || { echo "FAIL: needsuser taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/checkout")" = "missing_checkout" ] && echo "ok: checkout taxonomy" || { echo "FAIL: checkout taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/occupied")" = "occupied_worktree" ] && echo "ok: occupied taxonomy" || { echo "FAIL: occupied taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/nowork")" = "no_work_product" ] && echo "ok: nowork taxonomy" || { echo "FAIL: nowork taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/runner")" = "runner_timeout" ] && echo "ok: runner taxonomy" || { echo "FAIL: runner taxonomy"; fails=$((fails+1)); }
+  [ "$(final_reason provider_unavailable 99)" = "repeated_failure" ] && echo "ok: repeated terminal" || { echo "FAIL: repeated terminal"; fails=$((fails+1)); }
+  [ "$(final_reason provider_unavailable 0)" = "provider_unavailable" ] && echo "ok: fresh requeueable" || { echo "FAIL: fresh requeueable"; fails=$((fails+1)); }
+  [ "$(final_reason auth_required 99)" = "auth_required" ] && echo "ok: terminal stays" || { echo "FAIL: terminal stays"; fails=$((fails+1)); }
   check "provider failures requeue" reason_is_requeueable provider_unavailable
   check "transport failures requeue" reason_is_requeueable transport_timeout
+  check "runner timeouts requeue" reason_is_requeueable runner_timeout
   check_not "auth failures stay blocked" reason_is_requeueable auth_required
   check_not "test failures stay blocked" reason_is_requeueable tests_failed
+  check_not "needs-user stays blocked" reason_is_requeueable needs_user
+  check_not "repeated failures stay blocked" reason_is_requeueable repeated_failure
   rm -rf "$taxdir"
   # verify_work gate (#841): exercised in a throwaway git repo (log lives OUTSIDE the
   # worktree, like real $LOG_DIR runs; bare origin so origin/main..branch is resolvable)
@@ -988,8 +1023,8 @@ EOF
   fi
   [ -n "$log_tail" ] || log_tail="No provider output; see per-attempt failure diagnostics in $logf."
   local reason prior_attempts attempts
-  reason="$(blocked_reason_from_log "$logf")"
   prior_attempts="$(issue_attempts "$n")"
+  reason="$(final_reason "$(blocked_reason_from_log "$logf")" "$prior_attempts")"
   attempts=$((prior_attempts + 1))
   set_issue_reason "$n" "$reason" "$attempts"
   comment "$n" "task-board-loop: blocked_reason=$reason attempts=$attempts after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Last log lines:
