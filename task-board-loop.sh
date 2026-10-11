@@ -300,16 +300,25 @@ human_active() {
 # probe_gateway_model MODEL -> 0 if gateway virtual model answers a short ping
 # ponytail: probe only vps-gateway/* (their chains route whole provider pools);
 # non-gateway models rely on the verify gate instead of pre-flight probing.
+# #904: on failure the HTTP status + response snippet are left in PROBE_HTTP /
+# PROBE_BODY so the caller can log real error lines instead of a silent skip.
+PROBE_HTTP=""
+PROBE_BODY=""
 probe_gateway_model() {
   local model="$1" sub="${model#vps-gateway/}"
+  PROBE_HTTP=""; PROBE_BODY=""
   [ "$sub" = "$model" ] && return 0   # not a gateway model, nothing to probe
-  local code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+  local body_file
+  body_file="$(mktemp /tmp/probe.XXXXXX)"
+  PROBE_HTTP=$(curl -sS -o "$body_file" -w '%{http_code}' --max-time 20 \
     -H "Authorization: Bearer ${GATEWAY_API_KEY:-}" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$PROBE_MAX_TOKENS}" \
-    "$VPS_GATEWAY_URL/v1/chat/completions" 2>/dev/null) || return 1
-  [ "$code" = "200" ]
+    "$VPS_GATEWAY_URL/v1/chat/completions" 2>/dev/null) || { \
+      PROBE_HTTP="curl-error"; PROBE_BODY="$(head -c 300 "$body_file" 2>/dev/null)"; rm -f "$body_file"; return 1; }
+  PROBE_BODY="$(head -c 300 "$body_file" 2>/dev/null)"
+  rm -f "$body_file"
+  [ "$PROBE_HTTP" = "200" ]
 }
 
 # worktree_fingerprint WT -> HEAD + sorted porcelain status.
@@ -343,15 +352,33 @@ verify_work() {
   [ "$(git -C "$wt" rev-list --count "origin/$MAIN_BRANCH..$branch" 2>/dev/null || echo 0)" -gt 0 ]
 }
 
+# error_log_tail LOG [LINES] -> last model error lines for diagnosis (#904).
+# Prefers error-pattern lines (error/fail/5xx/timeout/...), falls back to the
+# raw tail, and never returns empty so failure logs and diagnosis comments
+# always carry real content instead of 0B/33B silent marks.
+error_log_tail() {
+  local log="$1" lines="${2:-12}" out=""
+  if [ -f "$log" ]; then
+    out="$(grep -a -iE 'error|fail|exception|traceback|timeout|refused|invalid|denied|rate.limit| 4[0-9][0-9] | 5[0-9][0-9] ' "$log" 2>/dev/null | tail -n 5)"
+    [ -n "$out" ] || out="$(tail -n "$lines" "$log" 2>/dev/null)"
+  fi
+  [ -n "$out" ] || out="(no provider output at all: model produced 0 bytes)"
+  printf '%s\n' "$out"
+}
+
 # Append actionable process errors even when OpenCode exits without writing stdout.
+# #904: always capture the last model error lines so no failure is silent.
 record_attempt_failure() {
-  local model="$1" result="$2" size
+  local model="$1" result="$2" size errlines
   size=0
   [ ! -f "$logf" ] || size="$(wc -c < "$logf")"
   printf '\n[task-board-loop] attempt failed: model=%s exit=%s log_bytes=%s\n' \
     "$model" "$result" "$size" >> "$logf"
   if [ "$size" -eq 0 ]; then
     printf '[task-board-loop] OpenCode produced no output; inspect binary, model configuration, and provider connectivity.\n' >> "$logf"
+  else
+    errlines="$(error_log_tail "$logf" 8)"
+    printf '[task-board-loop] last model error lines:\n%s\n' "$errlines" | sed 's/^/  /' >> "$logf"
   fi
 }
 
@@ -409,10 +436,38 @@ if [ "$SELF_TEST" = "1" ]; then
   printf '%200s' '' > "$vlog"
   git -C "$vdir/wt" checkout -q main
   check_not "verify fails: substantial log without work product" verify_work "$vlog" "$vdir/wt" main
+  # #904: banner-only logs can never close an issue, even with a dirty tree
+  printf 'opencode session banner only\n' > "$vlog"   # 28 bytes < MIN_LOG_BYTES
+  echo change3 > "$vdir/wt/seed"
+  check_not "gate refuses banner-only log despite dirty tree" verify_work "$vlog" "$vdir/wt" work/1
   rm -rf "$vdir"
   else
     echo "FAIL: vwtest repo setup"; fails=$((fails+1)); rm -rf "$vdir"
   fi
+  # #904: failure diagnosis always carries real model error lines, never 0B/33B silent marks
+  elog="$(mktemp /tmp/elog.XXXXXX)"
+  printf 'fatal: provider 500 internal error\n' > "$elog"
+  case "$(error_log_tail "$elog")" in *"500 internal error"*) echo "ok: error_log_tail prefers error lines";; *) echo "FAIL: error_log_tail prefers error lines"; fails=$((fails+1));; esac
+  printf 'just a quiet line\n' > "$elog"
+  case "$(error_log_tail "$elog")" in *"quiet line"*) echo "ok: error_log_tail falls back to raw tail";; *) echo "FAIL: error_log_tail falls back to raw tail"; fails=$((fails+1));; esac
+  case "$(error_log_tail "/tmp/does-not-exist-$$")" in *"(no provider output"*) echo "ok: error_log_tail never returns empty";; *) echo "FAIL: error_log_tail never returns empty"; fails=$((fails+1));; esac
+  rm -f "$elog"
+  logf="$(mktemp /tmp/selflog.XXXXXX)"
+  : > "$logf"
+  record_attempt_failure "vps-gateway/coding-fast" 1
+  if grep -q "attempt failed: model=vps-gateway/coding-fast" "$logf" && grep -q "no output" "$logf"; then
+    echo "ok: 0B failure records diagnosis"
+  else
+    echo "FAIL: 0B failure records diagnosis"; fails=$((fails+1))
+  fi
+  printf 'boom: timeout talking to provider\n' > "$logf"
+  record_attempt_failure "vps-gateway/coding-fast" 1
+  if grep -q "last model error lines" "$logf" && grep -q "timeout talking to provider" "$logf"; then
+    echo "ok: failure log captures last model error lines"
+  else
+    echo "FAIL: failure log captures last model error lines"; fails=$((fails+1))
+  fi
+  rm -f "$logf"
   [ "$(pick_model 0)" = "${MODELS[0]}" ] && echo "ok: pick_model 0" || { echo "FAIL: pick_model 0"; fails=$((fails+1)); }
   [ "$(pick_model ${#MODELS[@]})" = "${MODELS[0]}" ] && echo "ok: pick_model wraps" || { echo "FAIL: pick_model wraps"; fails=$((fails+1)); }
   if [ "$(date -d '2026-09-06T03:24:58Z' +%s 2>/dev/null || echo 0)" -gt 0 ]; then echo "ok: iso date parse"; else echo "FAIL: iso date parse"; fails=$((fails+1)); fi
@@ -858,6 +913,8 @@ EOF
 )
       if ! probe_gateway_model "$model"; then
         heartbeat "model $model dead (gateway probe fail), skipping to next"
+        printf '\n[task-board-loop] probe failed: model=%s http=%s body=%s\n' \
+          "$model" "${PROBE_HTTP:-unknown}" "${PROBE_BODY:-no response}" >> "$logf"
         result=1
       else
         set +e
@@ -866,12 +923,13 @@ EOF
         set -e
       fi
     fi
-    # verify-before-done gate (#841): exit-0 alone is NOT success
+    # verify-before-done gate (#841/#904): exit-0 alone is NOT success
     if [ "$result" = "0" ] && [ "$DRY" != "1" ]; then
       if verify_work "$logf" "$wt" "$branch" "$base_fp"; then
         heartbeat "verify OK for #$n (log $(wc -c < "$logf") bytes, real work present)"
       else
         heartbeat "verify FAILED for #$n (exit-0 but no work product) — downgrading"
+        printf '\n[task-board-loop] verify-before-done gate REFUSED status:done for #%s: exit 0 but no work product (banner-only/empty log, no diff, no commits)\n' "$n" >> "$logf"
         result=1
       fi
     fi
@@ -906,11 +964,9 @@ EOF
     fi
   done
 
-  # all retries exhausted
+  # all retries exhausted: diagnosis always carries the last model error lines (#904)
   local log_tail=""
-  if [ -f "$logf" ]; then
-    log_tail="$(tail -c 4000 "$logf" | tail -12 | sed 's/`/'"'"'/g')"
-  fi
+  log_tail="$(error_log_tail "$logf" 12 | sed 's/`/'"'"'/g')"
   [ -n "$log_tail" ] || log_tail="No provider output; see per-attempt failure diagnostics in $logf."
   comment "$n" "task-board-loop: failed after $((MAX_RETRIES+1)) attempts (model chain: $MODEL_CHAIN). Log: \`$logf\`. Needs investigation. Last log lines:
 $log_tail"
