@@ -114,7 +114,9 @@ blocked_reason_from_log() {
     echo "ambiguous_request"
   elif [[ "$text" =~ ((^|[^a-z])tests?[[:space:]_-]*failed|failing[[:space:]]+tests?|pytest.*(failed|error)|npm[[:space:]]+test.*(failed|error)) ]]; then
     echo "tests_failed"
-  elif [[ "$text" =~ (no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed|runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out) ]]; then
+  elif [[ "$text" =~ (runner[[:space:]_-]*timeout|job[[:space:]_-]*timed[[:space:]_-]*out|opencode[[:space:]_-]*timed?[[:space:]_-]*out|command[[:space:]]+timed[[:space:]]+out|killed[[:space:]]+by[[:space:]]+timeout|timeout[[:space:]]+after[[:space:]]+[0-9]+s) ]]; then
+    echo "runner_timeout"
+  elif [[ "$text" =~ (no[[:space:]_-]*work[[:space:]_-]*product|verify[[:space:]_-]*failed) ]]; then
     echo "no_work_product"
   elif [[ "$text" =~ (transport[[:space:]_-]*(timeout|reset|failure)|streaming[[:space:]_-]*abort|mcp[[:space:]_-]*transport) ]]; then
     echo "transport_timeout"
@@ -127,7 +129,7 @@ blocked_reason_from_log() {
 
 reason_is_requeueable() {
   case "${1:-}" in
-    provider_unavailable|transport_timeout|worktree_unavailable|no_work_product) return 0 ;;
+    provider_unavailable|transport_timeout|worktree_unavailable|no_work_product|runner_timeout) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -234,6 +236,8 @@ if [ "$SIMULATE" = "1" ]; then
 provider_unavailable|0|1|0|100|399|300|cooldown
 provider_unavailable|1|1|0|100|999|300|blocked
 transport_timeout|0|1|0|100|500|300|requeue
+runner_timeout|0|1|0|100|500|300|requeue
+runner_timeout|1|1|0|100|999|300|blocked
 worktree_unavailable|0|1|0|100|500|300|requeue
 no_work_product|0|1|0|100|500|300|requeue
 no_work_product|0|0|0|100|500|300|blocked
@@ -678,7 +682,8 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'test coverage summary: all passing\n' > "$taxdir/test-success"
   printf 'HTTP 503 Rate Limit\n' > "$taxdir/provider-upper"
   printf 'upstream timeout HTTP 503\n' > "$taxdir/provider"
-  printf 'runner timeout: no work product\n' > "$taxdir/runner"
+  printf 'opencode timed out after 600s\n' > "$taxdir/runner"
+  printf 'no work product: empty diff\n' > "$taxdir/nowork"
   printf 'transport timeout while streaming\n' > "$taxdir/transport"
   printf 'project checkout not found\n' > "$taxdir/checkout"
   printf 'worktree path occupied by live worktree\n' > "$taxdir/occupied"
@@ -694,7 +699,8 @@ if [ "$SELF_TEST" = "1" ]; then
   check "passing test mention is not a test failure" test "$(blocked_reason_from_log "$taxdir/test-success")" = execution_failed
   check "case-insensitive provider taxonomy" test "$(blocked_reason_from_log "$taxdir/provider-upper")" = provider_unavailable
   [ "$(blocked_reason_from_log "$taxdir/provider")" = "provider_unavailable" ] && echo "ok: provider taxonomy" || { echo "FAIL: provider taxonomy"; fails=$((fails+1)); }
-  [ "$(blocked_reason_from_log "$taxdir/runner")" = "no_work_product" ] && echo "ok: runner timeout/no-work taxonomy" || { echo "FAIL: runner timeout/no-work taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/runner")" = "runner_timeout" ] && echo "ok: runner timeout taxonomy" || { echo "FAIL: runner timeout taxonomy"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/nowork")" = "no_work_product" ] && echo "ok: no-work taxonomy" || { echo "FAIL: no-work taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/transport")" = "transport_timeout" ] && echo "ok: transport taxonomy" || { echo "FAIL: transport taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/checkout")" = "missing_checkout" ] && echo "ok: missing checkout taxonomy" || { echo "FAIL: missing checkout taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/occupied")" = "worktree_unavailable" ] && echo "ok: occupied worktree taxonomy" || { echo "FAIL: occupied worktree taxonomy"; fails=$((fails+1)); }
@@ -706,6 +712,7 @@ if [ "$SELF_TEST" = "1" ]; then
   check "provider failures requeue" reason_is_requeueable provider_unavailable
   check "no-work retries requeue" reason_is_requeueable no_work_product
   check "transport failures requeue" reason_is_requeueable transport_timeout
+  check "runner timeouts requeue" reason_is_requeueable runner_timeout
   check_not "auth failures stay blocked" reason_is_requeueable auth_required
   check_not "missing checkout stays blocked" reason_is_requeueable missing_checkout
   check_not "needs-user stays blocked" reason_is_requeueable needs_user

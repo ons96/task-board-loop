@@ -28,7 +28,8 @@ missing credentials, destructive operations, or unavailable repository access.
 Blocked attempts use one `blocked_reason:<value>` label and one `attempts:<n>`
 label, whether left terminally blocked or queued for bounded recovery. Canonical
 reasons are `provider_unavailable`, `transport_timeout`,
-`worktree_unavailable`, and `no_work_product` (allowlisted for bounded retry),
+`worktree_unavailable`, `runner_timeout`, and `no_work_product` (allowlisted
+for bounded retry),
 plus `needs_user`, `auth_required`, `missing_checkout`, `destructive_request`,
 `ambiguous_request`, `tests_failed`, `worktree_conflict`, and
 `execution_failed` (not automatically retried). Comments record
