@@ -51,6 +51,7 @@
 #   RECOVERY_COOLDOWN base seconds per recovery-after gate; scales linearly
 #                      with prior attempts (default: 300)
 #   OPENCODE_MODEL_CHAIN comma-separated opencode model ids; retry advances to next (default below)
+#   PROBE_CHAIN        probe-order the chain at startup from live results (default 1; 0 = static order)
 #   FREE_MODEL_ALLOWLIST comma-separated models with current verified-free evidence; required for live runs
 #   OPENCODE_MODEL    if set, prepended to the chain as first choice
 #   MIN_LOG_BYTES     verify gate: /work log smaller than this = failure (default: 200)
@@ -556,6 +557,23 @@ pick_model() {
   echo "${MODELS[$i]}"
 }
 
+# order_chain_by_probe: stdin "model ok|dead|unknown" lines -> ordered models.
+# Probe results, not the static hardcode, decide fallback order (#904):
+# working models first (preference order), then unprobed/unknown. Dead models
+# are dropped whenever any live candidate exists, and if every candidate is
+# dead the full candidate order is kept - one dead virtual can never collapse
+# the chain to fewer attempts than candidates.
+order_chain_by_probe() {
+  awk '
+    { m=$1; r=$2; res[m]=r; order[++n]=m }
+    END {
+      out=0
+      for (i=1;i<=n;i++) if (res[order[i]]=="ok") { print order[i]; out++ }
+      for (i=1;i<=n;i++) if (res[order[i]]!="ok" && res[order[i]]!="dead") { print order[i]; out++ }
+      if (out==0) for (i=1;i<=n;i++) print order[i]
+    }'
+}
+
 run_opencode() {
   local model="$1" prompt="$2"
   local -a cmd=(timeout "$OPENCODE_TIMEOUT" nice -n "$OPENCODE_NICE")
@@ -589,6 +607,30 @@ probe_gateway_model() {
     -d "{\"model\":\"$sub\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":$PROBE_MAX_TOKENS}" \
     "$VPS_GATEWAY_URL/v1/chat/completions" 2>/dev/null) || return 1
   [ "$code" = "200" ]
+}
+
+# probe_chain_candidates MODEL... -> "model ok|dead" lines for order_chain_by_probe.
+# Gateway virtuals are curl-probed (dead ones skipped); non-gateway models have
+# no cheap probe and are kept (they rely on the verify gate instead).
+probe_chain_candidates() {
+  local m
+  for m in "$@"; do
+    if probe_gateway_model "$m"; then
+      printf '%s ok\n' "$m"
+    else
+      printf '%s dead\n' "$m"
+    fi
+  done
+}
+
+# apply_probe_chain_order: re-order the global MODELS array from live probe
+# results at startup (#904). PROBE_CHAIN=0 keeps the static order.
+apply_probe_chain_order() {
+  local results ordered
+  results="$(probe_chain_candidates "${MODELS[@]}")"
+  ordered="$(printf '%s\n' "$results" | order_chain_by_probe)"
+  [ -n "$ordered" ] || return 0
+  mapfile -t MODELS <<< "$ordered"
 }
 
 # worktree_fingerprint WT -> HEAD + sorted porcelain status.
@@ -916,6 +958,19 @@ if [ "$SELF_TEST" = "1" ]; then
   else
     echo "FAIL: vwtest repo setup"; fails=$((fails+1)); rm -rf "$vdir"
   fi
+  # #904: probe-sourced chain ordering (offline fixtures)
+  ch_out="$(printf 'a ok\nb dead\nc ok\n' | order_chain_by_probe | paste -sd, -)"
+  [ "$ch_out" = "a,c" ] && echo "ok: dead model dropped, live kept" || { echo "FAIL: dead model dropped, live kept (got=$ch_out)"; fails=$((fails+1)); }
+  ch_out="$(printf 'a dead\nb dead\nc dead\n' | order_chain_by_probe | paste -sd, -)"
+  [ "$ch_out" = "a,b,c" ] && echo "ok: all-dead keeps full candidate order" || { echo "FAIL: all-dead keeps full order (got=$ch_out)"; fails=$((fails+1)); }
+  ch_out="$(printf 'a unknown\nb ok\nc dead\n' | order_chain_by_probe | paste -sd, -)"
+  [ "$ch_out" = "b,a" ] && echo "ok: ok-first, unknown kept, dead dropped" || { echo "FAIL: ok-first ordering (got=$ch_out)"; fails=$((fails+1)); }
+  ch_out="$(printf 'a ok\nb ok\n' | order_chain_by_probe | paste -sd, -)"
+  [ "$ch_out" = "a,b" ] && echo "ok: preference order preserved" || { echo "FAIL: preference order (got=$ch_out)"; fails=$((fails+1)); }
+  ch_out="$(printf '' | order_chain_by_probe | paste -sd, -)"
+  [ -z "$ch_out" ] && echo "ok: empty candidates yield empty chain" || { echo "FAIL: empty candidates (got=$ch_out)"; fails=$((fails+1)); }
+  ch_out="$(printf 'dead/virtual dead\nlive/model ok\n' | order_chain_by_probe | paste -sd, -)"
+  [ "$ch_out" = "live/model" ] && echo "ok: single dead virtual cannot kill the chain" || { echo "FAIL: single dead virtual (got=$ch_out)"; fails=$((fails+1)); }
   [ "$(pick_model 0)" = "${MODELS[0]}" ] && echo "ok: pick_model 0" || { echo "FAIL: pick_model 0"; fails=$((fails+1)); }
   [ "$(pick_model ${#MODELS[@]})" = "${MODELS[0]}" ] && echo "ok: pick_model wraps" || { echo "FAIL: pick_model wraps"; fails=$((fails+1)); }
   if [ "$(date -d '2026-09-06T03:24:58Z' +%s 2>/dev/null || echo 0)" -gt 0 ]; then echo "ok: iso date parse"; else echo "FAIL: iso date parse"; fails=$((fails+1)); fi
@@ -1464,6 +1519,10 @@ EOF
 }
 
 # --- main loop ---
+# #904: chain order comes from live probe results, not the static inventory.
+if [ "$SELF_TEST" != "1" ] && [ "$SIMULATE" != "1" ] && [ "${PROBE_CHAIN:-1}" = "1" ]; then
+  apply_probe_chain_order || true
+fi
 heartbeat "starting (once=$ONCE max=$MAX dry=$DRY)"
 trap 'heartbeat "interrupted, summary: done=$DONE skipped=$SKIPPED blocked=$BLOCKED failed=$FAILED"; exit 130' INT TERM
 sweep_stale_locks || true  # startup reclaim before first claim
