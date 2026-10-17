@@ -95,8 +95,9 @@ Worktrees live on each device separately, so no branch collision.
 Priority labels: `priority:P0`..`priority:P9` (used for sort order)
 
 Blocked attempts record a canonical `blocked_reason` class:
-`provider_unavailable`, `transport_timeout`, `worktree_unavailable`, and
-`no_work_product` are transient and may be requeued once per budget
+`provider_unavailable`, `transport_timeout`, `worktree_unavailable`,
+`runner_timeout`, and `no_work_product` are transient and may be requeued
+once per budget
 (`MAX_RECOVERY_REQUEUES`, default 1) after a per-attempt cooldown/backoff
 (`recovery-after:<epoch>` label); `needs_user`, `auth_required`,
 `missing_checkout`, `destructive_request`, `ambiguous_request`, `tests_failed`,
