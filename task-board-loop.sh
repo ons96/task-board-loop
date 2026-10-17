@@ -57,7 +57,7 @@
 #   MIN_LOG_BYTES     verify gate: /work log smaller than this = failure (default: 200)
 #   OPENCODE_NICE     CPU niceness for active runs (default: 10)
 #   OPENCODE_IONICE   I/O priority class for active runs (default: 3/idle)
-#   OPENCODE_MEMORY_MAX_MB optional systemd user-scope memory cap
+#   OPENCODE_MEMORY_MAX_MB RAM ceiling for active runs via systemd-run (default: 1024; 0 disables)
 #   PAUSE_ON_HUMAN     pause claims while a user's opencode/omp session exists (default: 1)
 #   TASK_ALLOWED_SCOPES comma-separated scope tags this worker may claim
 #                      (default: vps-155,gateway-40; VPS stays specialized)
@@ -368,7 +368,7 @@ PROBE_MAX_TOKENS="${PROBE_MAX_TOKENS:-15}"
 MIN_LOG_BYTES="${MIN_LOG_BYTES:-200}"
 OPENCODE_NICE="${OPENCODE_NICE:-10}"
 OPENCODE_IONICE="${OPENCODE_IONICE:-3}"
-OPENCODE_MEMORY_MAX_MB="${OPENCODE_MEMORY_MAX_MB:-}"
+OPENCODE_MEMORY_MAX_MB="${OPENCODE_MEMORY_MAX_MB:-1024}"
 PAUSE_ON_HUMAN="${PAUSE_ON_HUMAN:-1}"
 TASK_ALLOWED_SCOPES="${TASK_ALLOWED_SCOPES:-vps-155,gateway-40}"
 # ponytail: targeted key extraction instead of sourcing ~/.env (stray-line exec gotcha)
@@ -574,18 +574,25 @@ order_chain_by_probe() {
     }'
 }
 
-run_opencode() {
-  local model="$1" prompt="$2"
-  local -a cmd=(timeout "$OPENCODE_TIMEOUT" nice -n "$OPENCODE_NICE")
+# build_opencode_cmd MODEL PROMPT -> fills global CMD with the footprint-capped
+# run command (#904): nice + ionice on every active run, plus a RAM ceiling
+# via systemd user-scope when available. Extracted so --self-test can verify
+# the caps are actually composed into the command.
+build_opencode_cmd() {
+  local mem_mb="${OPENCODE_MEMORY_MAX_MB:-1024}"
+  CMD=(timeout "$OPENCODE_TIMEOUT" nice -n "$OPENCODE_NICE")
   if command -v ionice >/dev/null 2>&1; then
-    cmd+=(ionice -c "$OPENCODE_IONICE")
+    CMD+=(ionice -c "$OPENCODE_IONICE")
   fi
-  cmd+=("$OPENCODE_BIN" run -m "$model" "$prompt")
-  if [ -n "$OPENCODE_MEMORY_MAX_MB" ] && command -v systemd-run >/dev/null 2>&1; then
-    systemd-run --user --scope --quiet -p "MemoryMax=${OPENCODE_MEMORY_MAX_MB}M" -- "${cmd[@]}"
-  else
-    "${cmd[@]}"
+  CMD+=("$OPENCODE_BIN" run -m "$1" "$2")
+  if [ -n "$mem_mb" ] && [ "$mem_mb" != "0" ] && command -v systemd-run >/dev/null 2>&1; then
+    CMD=(systemd-run --user --scope --quiet -p "MemoryMax=${mem_mb}M" -- "${CMD[@]}")
   fi
+}
+
+run_opencode() {
+  build_opencode_cmd "$1" "$2"
+  "${CMD[@]}"
 }
 
 human_active() {
@@ -958,6 +965,31 @@ if [ "$SELF_TEST" = "1" ]; then
   else
     echo "FAIL: vwtest repo setup"; fails=$((fails+1)); rm -rf "$vdir"
   fi
+  # #904: footprint caps are composed into every active run
+  OPENCODE_TIMEOUT=60 OPENCODE_BIN=opencode OPENCODE_NICE=10 OPENCODE_IONICE=3
+  OPENCODE_MEMORY_MAX_MB=512
+  build_opencode_cmd m "p"
+  cmd_str=" ${CMD[*]} "
+  if [[ "$cmd_str" == *" nice -n 10 "* && "$cmd_str" == *"MemoryMax=512M"* && "$cmd_str" == *" opencode run -m m "* ]]; then
+    echo "ok: footprint caps composed (nice + RAM ceiling)"
+  else
+    echo "FAIL: footprint caps composed (got=$cmd_str)"; fails=$((fails+1))
+  fi
+  OPENCODE_MEMORY_MAX_MB=0
+  build_opencode_cmd m "p"
+  case " ${CMD[*]} " in
+    *MemoryMax*) echo "FAIL: RAM ceiling disabled with 0"; fails=$((fails+1)) ;;
+    *) echo "ok: RAM ceiling disabled with 0" ;;
+  esac
+  # unset -> default 1024MB ceiling must still be composed (never unlimited)
+  OPENCODE_MEMORY_MAX_MB=""
+  build_opencode_cmd m "p"
+  case " ${CMD[*]} " in
+    *" MemoryMax=1024M "*) echo "ok: default RAM ceiling active (1024M)" ;;
+    *) echo "FAIL: default RAM ceiling active (got=${CMD[*]})"; fails=$((fails+1)) ;;
+  esac
+  OPENCODE_MEMORY_MAX_MB=512
+
   # #904: probe-sourced chain ordering (offline fixtures)
   ch_out="$(printf 'a ok\nb dead\nc ok\n' | order_chain_by_probe | paste -sd, -)"
   [ "$ch_out" = "a,c" ] && echo "ok: dead model dropped, live kept" || { echo "FAIL: dead model dropped, live kept (got=$ch_out)"; fails=$((fails+1)); }
