@@ -992,6 +992,25 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'opencode session banner only\n' > "$vlog"   # 28 bytes < MIN_LOG_BYTES
   echo change3 > "$vdir/wt/seed"
   check_not "gate refuses banner-only log despite dirty tree" verify_work "$vlog" "$vdir/wt" work/1
+  # #883: PR 6 test gate - repo tests must refuse done even when real work is
+  # present (dirty tree). A missing npm/pytest binary also fails the gate
+  # (command not found), so the failure path is verifiable on every device.
+  printf '%200s' '' > "$vlog"
+  printf '{"scripts":{"test":"exit 1"}}\n' > "$vdir/wt/package.json"
+  echo gate > "$vdir/wt/seed"
+  verify_result=0; verify_work "$vlog" "$vdir/wt" work/1 || verify_result=$?
+  [ "$verify_result" = 2 ] && echo "ok: npm test failure refuses dirty-tree done" || { echo "FAIL: npm test failure refuses dirty-tree done (exit=$verify_result)"; fails=$((fails+1)); }
+  if command -v npm >/dev/null 2>&1; then
+    printf '{"scripts":{"test":"exit 0"}}\n' > "$vdir/wt/package.json"
+    check "passing npm test keeps dirty-tree done" verify_work "$vlog" "$vdir/wt" work/1
+  else
+    echo "ok: npm absent; failure path already covered above (pass path skipped)"
+  fi
+  rm -f "$vdir/wt/package.json"
+  printf '[tool.pytest.ini_options]\n' > "$vdir/wt/pyproject.toml"
+  verify_result=0; verify_work "$vlog" "$vdir/wt" work/1 || verify_result=$?
+  [ "$verify_result" = 2 ] && echo "ok: pytest failure refuses dirty-tree done" || { echo "FAIL: pytest failure refuses dirty-tree done (exit=$verify_result)"; fails=$((fails+1)); }
+  rm -f "$vdir/wt/pyproject.toml"
   rm -rf "$vdir"
   else
     echo "FAIL: vwtest repo setup"; fails=$((fails+1)); rm -rf "$vdir"
