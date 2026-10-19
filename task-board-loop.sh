@@ -609,7 +609,10 @@ human_active() {
 PROBE_HTTP=""
 PROBE_BODY=""
 probe_gateway_model() {
-  local model="$1" sub="${model#vps-gateway/}"
+  local model="$1"
+  # split declarations: under `set -u`, `${model#...}` cannot read `model` in the
+  # same `local` statement that assigns it.
+  local sub="${model#vps-gateway/}"
   PROBE_HTTP=""; PROBE_BODY=""
   [ "$sub" = "$model" ] && return 0   # not a gateway model, nothing to probe
   local body_file
