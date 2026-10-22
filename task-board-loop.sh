@@ -736,7 +736,9 @@ worktree_fingerprint() {
 
 # verify_work LOG WT BRANCH [BASELINE] -> 0 only if the run produced real work.
 # Gate: log at least MIN_LOG_BYTES (bogus runs were 33-byte banner-only) AND
-# (dirty worktree OR commits ahead of main). BASELINE (a worktree_fingerprint
+# (dirty worktree OR commits ahead of main) AND the branch is on origin (#1128:
+# a local commit is not an artifact — #703/#919/#920 were marked done with
+# nothing pushed or reviewable). BASELINE (a worktree_fingerprint
 # snapshot taken before the run) additionally rejects no-op runs on adopted
 # worktrees whose pre-existing dirt would otherwise satisfy the gate (#929).
 verify_work() {
@@ -747,14 +749,25 @@ verify_work() {
   if [ -n "$baseline" ] && [ "$(worktree_fingerprint "$wt")" = "$baseline" ]; then
     return 1
   fi
-  if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
-    # ponytail: test gate, fail if tests exist and break
-    if [ -f "$wt/package.json" ]; then (cd "$wt" && npm test -- --silent) || return 2; elif [ -f "$wt/pyproject.toml" ]; then (cd "$wt" && pytest -q) || return 2; fi
-    return 0
-  fi
+  # ponytail: test gate, fail if tests exist and break
   if [ -f "$wt/package.json" ]; then (cd "$wt" && npm test -- --silent) || return 2; elif [ -f "$wt/pyproject.toml" ]; then (cd "$wt" && pytest -q) || return 2; fi
-  git -C "$wt" fetch origin "$MAIN_BRANCH" >/dev/null 2>&1 || true
-  [ "$(git -C "$wt" rev-list --count "origin/$MAIN_BRANCH..$branch" 2>/dev/null || echo 0)" -gt 0 ]
+  if [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    git -C "$wt" fetch origin "$MAIN_BRANCH" >/dev/null 2>&1 || true
+    [ "$(git -C "$wt" rev-list --count "origin/$MAIN_BRANCH..$branch" 2>/dev/null || echo 0)" -gt 0 ] || return 1
+  fi
+  # #1128: the branch must exist on origin and carry every local commit. Without
+  # this, /work can commit locally, exit 0, and the board records status:done
+  # for work no human or reviewer can reach.
+  git -C "$wt" fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || true
+  if ! git -C "$wt" rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+    printf '\n[task-board-loop] verify: branch %s was never pushed; a local commit is not reviewable\n' "$branch" >> "$log"
+    return 3
+  fi
+  if [ "$(git -C "$wt" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 1)" != "0" ]; then
+    printf '\n[task-board-loop] verify: %s has commits missing from origin/%s\n' "$branch" "$branch" >> "$log"
+    return 3
+  fi
+  return 0
 }
 
 # error_log_tail LOG [LINES] -> last model error lines for diagnosis (#904).
@@ -1079,10 +1092,15 @@ if [ "$SELF_TEST" = "1" ]; then
   vlog="$vdir/run.log"
   printf '%200s' '' > "$vlog"   # 200 bytes of padding
   check_not "verify fails: big log but clean tree, no commits" verify_work "$vlog" "$vdir/wt" work/1
-  echo change > "$vdir/wt/seed"     # dirty worktree
-  check "verify passes: dirty worktree" verify_work "$vlog" "$vdir/wt" work/1
-  git -C "$vdir/wt" commit -qam work   # commit the dirty change -> clean tree, ahead of origin/main
-  check "verify passes: commit ahead of origin/main" verify_work "$vlog" "$vdir/wt" work/1
+  echo change > "$vdir/wt/seed"     # dirty worktree, not pushed
+  check_not "verify fails: work never pushed (#1128)" verify_work "$vlog" "$vdir/wt" work/1
+  git -C "$vdir/wt" add -A && git -C "$vdir/wt" commit -qm work
+  check_not "verify fails: local commit missing from origin (#1128)" verify_work "$vlog" "$vdir/wt" work/1
+  git -C "$vdir/wt" push -q -u origin work/1 2>/dev/null
+  check "verify passes: pushed branch ahead of origin/main" verify_work "$vlog" "$vdir/wt" work/1
+  echo change1b > "$vdir/wt/seed"    # dirty on top of a pushed branch is reviewable
+  check "verify passes: dirty worktree on a pushed branch" verify_work "$vlog" "$vdir/wt" work/1
+  git -C "$vdir/wt" checkout -q -- seed
   printf 'banner only' > "$vlog"   # 11 bytes < MIN_LOG_BYTES
   echo change2 > "$vdir/wt/seed"
   check_not "verify fails: dirty tree but tiny log" verify_work "$vlog" "$vdir/wt" work/1
@@ -1642,7 +1660,7 @@ EOF
         if [ "$verify_result" = 2 ]; then
           printf '\n[task-board-loop] tests failed during verification\n' >> "$logf"
         else
-          printf '\n[task-board-loop] verify-before-done gate REFUSED status:done for #%s: exit 0 but no work product (banner-only/empty log, no diff, no commits)\n' "$n" >> "$logf"
+          printf '\n[task-board-loop] verify-before-done gate REFUSED status:done for #%s: exit 0 but no reviewable work product (banner-only/empty log, no diff, no commits, or branch not pushed to origin)\n' "$n" >> "$logf"
         fi
         result=1
       fi
@@ -1660,7 +1678,7 @@ EOF
         DONE=$((DONE+1))
         return 0
       fi
-      comment "$n" "task-board-loop: completed on attempt $((retry+1)) (model=$model, verified: log $(wc -c < "$logf")B + worktree diff)"
+      comment "$n" "task-board-loop: completed on attempt $((retry+1)) (model=$model, verified: log $(wc -c < "$logf")B + pushed branch \`$branch\`)"
       clear_issue_recovery "$n"
       unclaim "$n" "$DONE_LABEL"
       cleanup_worktree "$wt"
