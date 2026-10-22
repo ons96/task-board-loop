@@ -7,6 +7,8 @@
 # - Recovers occupied worktree paths: a stale wt dir from a dead run is reused or
 #   adopted (uncommitted leftovers kept, never force-removed), not a blocker (#929)
 # - Posts heartbeat comments so watchdog.sh detects liveness
+# - Refuses issues whose project: repo is role backup/scratch in the inventory,
+#   blocking them instead of pushing work into a repo that is not a project (#1129)
 # - Marks status:blocked + blocked_reason/attempts labels + comment if /work
 #   can't proceed; allowlisted transient reasons get one bounded recovery
 #   requeue to status:new behind a recovery-after:<epoch> cooldown gate (#944)
@@ -67,9 +69,13 @@
 #   STALE_GRACE       sweep frees same-host locks idle this long, seconds (default: 5400 = 90min)
 #   SWEEP_INTERVAL    min seconds between stale-lock sweeps (default: 1800)
 #   TASK_BOARD_REPO   GitHub repo for issue queue (default: ons96/task-board)
+#   REPO_ROLES_CACHE  local copy of task-board scripts/repos.yaml (default: $LOG_DIR/repos.yaml)
 
 set -euo pipefail
 TASK_BOARD_REPO="${TASK_BOARD_REPO:-ons96/task-board}"
+# Repo role inventory (#1129): task-board/scripts/repos.yaml is the single answer to
+# "what is this repo?". Cached locally so a run reads it once, not once per issue.
+REPO_ROLES_CACHE="${REPO_ROLES_CACHE:-${LOG_DIR:-$HOME/.local/state/task-board-loop/logs}/repos.yaml}"
 
 # --- args ---
 ONCE=0
@@ -523,6 +529,74 @@ requeue_claim_blocked() {
 # blocked_reason=missing_checkout with the cumulative attempt count, comment
 # the evidence, and release only our own claim to status:blocked. Human/operator
 # reason: never requeued.
+# --- repo role inventory (#1129) ---------------------------------------------
+# Reads task-board/scripts/repos.yaml. Unknown names are "unclassified", which is
+# NOT a block: the sweep reports those, and the loop keeps working them. Only a
+# positive role of backup/scratch stops the loop -- that is how #1037 pushed
+# work/* into a backup repo and #1048 into a throwaway one.
+repo_roles_file() {
+  local tmp
+  [ -s "$REPO_ROLES_CACHE" ] && { printf '%s\n' "$REPO_ROLES_CACHE"; return 0; }
+  tmp="$(mktemp "${TMPDIR:-/tmp}/repos.yaml.XXXXXX")" || return 1
+  if gh api "repos/$TASK_BOARD_REPO/contents/scripts/repos.yaml" --jq '.content' 2>/dev/null \
+      | base64 -d > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mkdir -p "$(dirname "$REPO_ROLES_CACHE")" 2>/dev/null || true
+    mv -f "$tmp" "$REPO_ROLES_CACHE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    printf '%s\n' "$REPO_ROLES_CACHE"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+repo_role() {
+  local repo="$1" f
+  f="$(repo_roles_file)" || { echo unclassified; return 0; }
+  awk -v want="$repo" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      sub(/[[:space:]]+#.*$/, "", line)
+      if (line !~ /^[A-Za-z0-9._-]+:[[:space:]]*\{/) next
+      name = line
+      sub(/:.*$/, "", name)
+      if (name != want) next
+      if (match(line, /role:[[:space:]]*[a-z_-]+/)) {
+        r = substr(line, RSTART, RLENGTH)
+        sub(/role:[[:space:]]*/, "", r)
+        print r
+        found = 1
+        exit
+      }
+    }
+    END { if (!found) print "unclassified" }
+  ' "$f"
+}
+
+block_repo_role() {
+  local n="$1" proj="$2" role="$3" count
+  owns_claim "$n" || return 1
+  count="$(issue_attempts "$n")" || count="unknown"
+  [ "$count" = unknown ] || count=$((count + 1))
+  comment "$n" "task-board-loop: blocked_reason=repo_role attempts=$count last_failure_class=repo_role; project:$proj is role=$role in task-board/scripts/repos.yaml, so this task must not be worked in it. Human/operator action required; not requeued."
+  [ "$count" = unknown ] || set_issue_reason "$n" repo_role "$count" || true
+  unclaim "$n" "$BLOCKED_LABEL"
+}
+
+# 0 = loop may work this repo; 1 = refused (issue already blocked)
+repo_role_guard() {
+  local n="$1" proj="$2" role
+  role="$(repo_role "$proj")"
+  case "$role" in
+    backup|scratch)
+      heartbeat "project:$proj is role=$role; refusing loop work for #$n"
+      block_repo_role "$n" "$proj" "$role" || return 1
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 block_missing_checkout() {
   local n="$1" proj="$2" count
   owns_claim "$n" || return 1
@@ -963,6 +1037,31 @@ if [ "$SELF_TEST" = "1" ]; then
   ghmock_seed 212 "status:in_progress" "locked-by:other-worker" "project:no-such-repo"
   check_not "foreign claim refuses missing-checkout block" block_missing_checkout 212 "no-such-repo"
   check "foreign issue untouched by missing-checkout block" test "$(jq -r '.labels | map(.name) | join(",")' "$ghdir/issue-212.json")" = "status:in_progress,locked-by:other-worker,project:no-such-repo"
+  # G: repo-role guard (#1129) -- backup/scratch repos never receive loop work
+  printf '%s\n' \
+    'realproj:    {role: project, why: "real work"}' \
+    'backuprepo:  {role: backup,  why: "snapshot"}' \
+    'scratchrepo: {role: scratch, why: "throwaway"}' \
+    '# commented: {role: backup}' \
+    > "$ghdir/repos.yaml"
+  REPO_ROLES_CACHE="$ghdir/repos.yaml"
+  check "role: project read from inventory" test "$(repo_role realproj)" = project
+  check "role: backup read from inventory" test "$(repo_role backuprepo)" = backup
+  check "role: scratch read from inventory" test "$(repo_role scratchrepo)" = scratch
+  check "role: unlisted repo is unclassified" test "$(repo_role mystery)" = unclassified
+  check "role: commented-out entry is not a role" test "$(repo_role commented)" = unclassified
+  ghmock_seed 213 "status:in_progress" "$LOCK_LABEL"
+  check_not "scratch repo refuses loop work" repo_role_guard 213 scratchrepo
+  check "scratch repo records repo_role" ghmock_has 213 "blocked_reason:repo_role"
+  check "scratch repo blocks the issue" ghmock_has 213 "status:blocked"
+  check_not "scratch repo keeps no lock" ghmock_has 213 "$LOCK_LABEL"
+  check "scratch repo comment names the role" grep -qF "role=scratch" "$ghdir/comments.txt"
+  ghmock_seed 214 "status:in_progress" "$LOCK_LABEL"
+  check "project repo passes the guard" repo_role_guard 214 realproj
+  check "project repo keeps its lock" ghmock_has 214 "$LOCK_LABEL"
+  ghmock_seed 215 "status:in_progress" "$LOCK_LABEL"
+  check "unclassified repo passes the guard" repo_role_guard 215 mystery
+  check "missing inventory reads as unclassified" test "$(REPO_ROLES_CACHE="$ghdir/nope.yaml" repo_role realproj)" = unclassified
   unset -f comment heartbeat
   unset -f gh ghmock_seed ghmock_seed_closed ghmock_has ghmock_count ghmock_gate ghmock_state
   rm -rf "$ghdir"
@@ -1394,6 +1493,11 @@ resolve_repo_for_issue() {
   local n="$1" proj hit=""
   proj="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json labels --jq '.labels[].name' 2>/dev/null \
           | grep -oE '^project:[a-z0-9_-]+$' | head -1 | cut -d: -f2)"
+  # #1129: a backup/scratch repo is a checkout that must never receive loop work
+  if [ -n "$proj" ] && ! repo_role_guard "$n" "$proj"; then
+    BLOCKED=$((BLOCKED+1))
+    return 1
+  fi
   if [ -n "$proj" ]; then
     hit="$(find_checkout "$HOME/CodingProjects" "$proj" || true)"
   fi
