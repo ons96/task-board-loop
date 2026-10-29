@@ -49,15 +49,15 @@ The loop runs 24/7 in tmux on VPS-155 (`oci-agent-vnic`); zero autonomous load o
 
 ```bash
 # start (from laptop)
-ssh ubuntu@155.248.217.255 'tmux new-session -d -s taskboard-loop -c ~/task-board-loop "env OPENCODE_HEADLESS=1 OPENCODE_MODEL=vps-gateway/coding-fast ./task-board-loop.sh"'
+ssh ubuntu@<VPS155_IP> 'tmux new-session -d -s taskboard-loop -c ~/task-board-loop "env OPENCODE_HEADLESS=1 OPENCODE_MODEL=vps-gateway/coding-fast ./task-board-loop.sh"'
 # watchdog kills silent loops (>30min no heartbeat), every 10min
-ssh ubuntu@155.248.217.255 'systemctl --user enable --now task-board-loop-watchdog.timer'
+ssh ubuntu@<VPS155_IP> 'systemctl --user enable --now task-board-loop-watchdog.timer'
 # status
-ssh ubuntu@155.248.217.255 'tmux ls | grep taskboard; cat /tmp/agent-loop.heartbeat'
+ssh ubuntu@<VPS155_IP> 'tmux ls | grep taskboard; cat /tmp/agent-loop.heartbeat'
 # restart: pull latest, kill session, start again
-ssh ubuntu@155.248.217.255 'git -C ~/task-board-loop pull --ff-only && tmux kill-session -t taskboard-loop'
+ssh ubuntu@<VPS155_IP> 'git -C ~/task-board-loop pull --ff-only && tmux kill-session -t taskboard-loop'
 # stop
-ssh ubuntu@155.248.217.255 'tmux kill-session -t taskboard-loop'
+ssh ubuntu@<VPS155_IP> 'tmux kill-session -t taskboard-loop'
 ```
 
 Notes:
