@@ -327,6 +327,10 @@ elif [ -x "$DEFAULT_OPENCODE_BIN" ]; then
 else
   OPENCODE_BIN="${OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
 fi
+# Loop agents must not reach production hosts or system Python (#949 incident:
+# agent SSHed to VPS-40, edited live .env, ran pip --break-system-packages).
+# opencode merges this over the user config; later bash rules win over "*".
+export OPENCODE_CONFIG_CONTENT="${LOOP_CONFIG_CONTENT:-{\"permission\":{\"bash\":{\"ssh *\":\"deny\",\"scp *\":\"deny\",\"rsync *\":\"deny\",\"sftp *\":\"deny\",\"pip install *\":\"deny\",\"pip3 install *\":\"deny\",\"*--break-system-packages*\":\"deny\"}}}}"
 IDLE_SLEEP="${IDLE_SLEEP:-60}"
 OPENCODE_TIMEOUT="${OPENCODE_TIMEOUT:-1800}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
@@ -1144,6 +1148,12 @@ if [ "$SELF_TEST" = "1" ]; then
     echo "FAIL: failure log captures last model error lines"; fails=$((fails+1))
   fi
   rm -f "$logf"
+  # #949: loop agents get ssh/system-pip denied via merged config
+  if printf '%s' "$OPENCODE_CONFIG_CONTENT" | python3 -c 'import json,sys; b=json.load(sys.stdin)["permission"]["bash"]; sys.exit(0 if b.get("ssh *")=="deny" and b.get("*--break-system-packages*")=="deny" else 1)'; then
+    echo "ok: loop config denies ssh + system pip"
+  else
+    echo "FAIL: loop config denies ssh + system pip"; fails=$((fails+1))
+  fi
   # #904: footprint caps are composed into every active run
   OPENCODE_TIMEOUT=60 OPENCODE_BIN=opencode OPENCODE_NICE=10 OPENCODE_IONICE=3
   OPENCODE_MEMORY_MAX_MB=512
