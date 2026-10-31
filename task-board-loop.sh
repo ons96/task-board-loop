@@ -109,7 +109,7 @@ blocked_reason_from_log() {
   text="$(tail -c 12000 "$log" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
   if [[ "$text" =~ (missing[[:space:]_-]*checkout|no[[:space:]_-]*matching[[:space:]_-]*checkout|checkout[[:space:]_-]*not[[:space:]_-]*found|repository[[:space:]_-]*not[[:space:]_-]*found|access[[:space:]_-]*denied) ]]; then
     echo "missing_checkout"
-  elif [[ "$text" =~ (occupied.*worktree|worktree.*(busy|occupied|locked)) ]]; then
+  elif [[ "$text" =~ (occupied.*worktree|worktree[[:space:]]+(is[[:space:]]+)?(busy|occupied|locked)) ]]; then
     echo "worktree_unavailable"
   elif [[ "$text" =~ (missing[[:space:]_-]*credentials|needs[[:space:]_-]*user|operator[[:space:]_-]*action) ]]; then
     echo "needs_user"
@@ -127,7 +127,7 @@ blocked_reason_from_log() {
     echo "no_work_product"
   elif [[ "$text" =~ (transport[[:space:]_-]*(timeout|reset|failure)|streaming[[:space:]_-]*abort|mcp[[:space:]_-]*transport) ]]; then
     echo "transport_timeout"
-  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream|probe[[:space:]]+failed) ]]; then
+  elif [[ "$text" =~ (timeout|timed[[:space:]]+out|connection[[:space:]]+reset|connection[[:space:]]+refused|network|502|503|504|rate[[:space:]_-]*limit|429|upstream|probe[[:space:]]+failed|sign[[:space:]_-]*up[[:space:]_-]*for[[:space:]_-]*free) ]]; then
     echo "provider_unavailable"
   else
     echo "execution_failed"
@@ -858,6 +858,8 @@ if [ "$SELF_TEST" = "1" ]; then
   printf 'shell exited unexpectedly\n' > "$taxdir/execution"
   printf 'gateway probe failed for model=vps-gateway/coding-fast (cause unknown)\n' > "$taxdir/probe"
   printf 'the latest failed CI run had no other errors\n' > "$taxdir/latest-failed"
+  printf 'task-board-loop: worktrees=/tmp/wt lock=locked-by:local-Owen-XPG\n' > "$taxdir/worktree-header"
+  printf 'Sign up for free to continue and explore 500 other models\n' > "$taxdir/signup"
   [ "$(blocked_reason_from_log "$taxdir/auth")" = "auth_required" ] && echo "ok: auth taxonomy" || { echo "FAIL: auth taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/destructive")" = "destructive_request" ] && echo "ok: destructive taxonomy" || { echo "FAIL: destructive taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/ambiguous")" = "ambiguous_request" ] && echo "ok: ambiguous taxonomy" || { echo "FAIL: ambiguous taxonomy"; fails=$((fails+1)); }
@@ -875,6 +877,8 @@ if [ "$SELF_TEST" = "1" ]; then
   [ "$(blocked_reason_from_log "$taxdir/execution")" = "execution_failed" ] && echo "ok: execution taxonomy" || { echo "FAIL: execution taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/probe")" = "provider_unavailable" ] && echo "ok: dead gateway probe is provider-unavailable" || { echo "FAIL: dead gateway probe taxonomy"; fails=$((fails+1)); }
   [ "$(blocked_reason_from_log "$taxdir/latest-failed")" = "execution_failed" ] && echo "ok: latest-failed wording is not a test failure" || { echo "FAIL: latest-failed false positive"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/worktree-header")" = "execution_failed" ] && echo "ok: worktree header is not worktree_unavailable" || { echo "FAIL: worktree header false positive"; fails=$((fails+1)); }
+  [ "$(blocked_reason_from_log "$taxdir/signup")" = "provider_unavailable" ] && echo "ok: signup wall is provider_unavailable" || { echo "FAIL: signup wall taxonomy"; fails=$((fails+1)); }
   check "provider failures requeue" reason_is_requeueable provider_unavailable
   check "no-work retries requeue" reason_is_requeueable no_work_product
   check "transport failures requeue" reason_is_requeueable transport_timeout
