@@ -621,7 +621,12 @@ claimable_issue() {
     .state == "OPEN" and
     ([.labels[].name] | index("status:new") != null and index($completed) == null and
       index($blocked) == null and index($progress) == null and
+      index("retry-exhausted") == null and
       all(.[]; (startswith("locked-by:") | not) and
+        # blocked-by:user|infra are real dependencies (console access, infra work).
+        # blocked-by:worker|unverified are attempt history from past loop runs, so
+        # they must not freeze an issue forever (59 of 74 new issues carried worker).
+        ((startswith("blocked-by:user") or startswith("blocked-by:infra")) | not) and
         (if startswith("recovery-after:") then
           (ltrimstr("recovery-after:") | tonumber? // ($now + 1)) <= $now
          else true end)))
@@ -919,6 +924,11 @@ if [ "$SELF_TEST" = "1" ]; then
   check_not "claim rejects another worker lock" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"locked-by:other"}]}' 500
   check_not "claim rejects in-progress status" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"status:in_progress"}]}' 500
   check_not "claim rejects closed issue" claimable_issue '{"state":"CLOSED","labels":[{"name":"status:new"}]}' 500
+  check_not "claim rejects user-blocked issue" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"blocked-by:user"}]}' 500
+  check_not "claim rejects infra-blocked issue" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"blocked-by:infra"}]}' 500
+  check "claim accepts stale worker blocker" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"blocked-by:worker"}]}' 500
+  check "claim accepts unverified blocker" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"blocked-by:unverified"}]}' 500
+  check_not "claim rejects retry-exhausted issue" claimable_issue '{"state":"OPEN","labels":[{"name":"status:new"},{"name":"retry-exhausted"}]}' 500
   check "owned in-progress claim" owned_claim_json "{\"state\":\"OPEN\",\"labels\":[{\"name\":\"status:in_progress\"},{\"name\":\"$LOCK_LABEL\"}]}"
   check_not "competing lock prevents metadata updates" owned_claim_json "{\"state\":\"OPEN\",\"labels\":[{\"name\":\"status:in_progress\"},{\"name\":\"$LOCK_LABEL\"},{\"name\":\"locked-by:other\"}]}"
   check_not "lost lock prevents metadata updates" owned_claim_json '{"state":"OPEN","labels":[{"name":"status:in_progress"},{"name":"locked-by:other"}]}'
@@ -1289,9 +1299,11 @@ next_issue() {
   # ponytail: first candidate in this worker's scope whose repo exists locally wins
   # recovery-after gates ride along as a 4th column; pick_claimable fails closed
   # on future or malformed gates (claim() re-checks via claimable_issue).
+  # retry-exhausted and blocked-by:user|infra are excluded here too, so the loop
+  # never picks work that claim() would then refuse (wasted attempt + label churn).
   echo "$json" | jq -r --arg done "$DONE_LABEL" --arg blocked "$BLOCKED_LABEL" '
       .[]
-      | select((.labels | map(.name) | any(. == $done or . == $blocked or startswith("locked-by:"))) | not)
+      | select((.labels | map(.name) | any(. == $done or . == $blocked or . == "retry-exhausted" or startswith("locked-by:") or startswith("blocked-by:user") or startswith("blocked-by:infra"))) | not)
       | "\(.number) \(.labels | map(.name) | map(select(startswith("project:"))) | .[0] // "") \(.labels | map(.name) | map(select(startswith("tag:")) | sub("^tag:"; "") | select(. == "cross-device" or . == "device-local" or . == "vps-155" or . == "gateway-40" or . == "github-actions")) | .[0] // "cross-device") \(.labels | map(.name) | map(select(startswith("recovery-after:")) | sub("^recovery-after:"; "")) | join(","))"
     ' | pick_claimable || true
 }
