@@ -678,6 +678,29 @@ run_opencode() {
   "${CMD[@]}"
 }
 
+# build_work_prompt N META -> the /work prompt for one issue.
+# #927: partial completion is required behavior, not an abort. The runner also
+# preserves a status:blocked decision instead of overwriting it with done.
+build_work_prompt() {
+  local n="$1" meta="$2"
+  cat <<EOF
+/work $n
+
+Issue: #$n
+Title: $(printf '%s' "$meta" | jq -r .t)
+Labels: $(printf '%s' "$meta" | jq -r '.labs | join(", ")')
+
+Body:
+$(printf '%s' "$meta" | jq -r .b)
+
+SKIP-BLOCKED-STEPS (mandatory for this run):
+- Work every doable step of this issue in this run. If one step needs user input, a credential, a decision, or an unavailable external resource, skip ONLY that step and continue with the remaining steps.
+- Do not abort the whole issue at the first blocker and do not stop to wait for a human.
+- At the end, if any required step was skipped, comment "SKIP-BLOCKED: <exact input needed>" and mark the issue status:blocked (remove status:in_progress and locked-by:*). Never mark done for skipped work.
+- If every acceptance criterion is satisfied, leave the issue in_progress; the runner verifies and closes it.
+EOF
+}
+
 human_active() {
   [ "$PAUSE_ON_HUMAN" = "1" ] || return 1
   pgrep -u "$(id -u)" -x opencode >/dev/null 2>&1 ||
@@ -1189,6 +1212,16 @@ if [ "$SELF_TEST" = "1" ]; then
   esac
   OPENCODE_MEMORY_MAX_MB=512
 
+  # #927: prompt must carry partial-completion behavior, and the runner must
+  # preserve a blocked verdict (checked below as strings; no network).
+  wp="$(build_work_prompt 9 '{"n":9,"t":"T","b":"B","labs":["status:new"]}')"
+  for needle in '/work 9' 'SKIP-BLOCKED-STEPS' 'skip ONLY that step' 'Do not abort' 'status:blocked'; do
+    case "$wp" in
+      *"$needle"*) echo "ok: prompt contains $needle" ;;
+      *) echo "FAIL: prompt missing $needle"; fails=$((fails+1)) ;;
+    esac
+  done
+
   # #904: probe-sourced chain ordering (offline fixtures)
   ch_out="$(printf 'a ok\nb dead\nc ok\n' | order_chain_by_probe | paste -sd, -)"
   [ "$ch_out" = "a,c" ] && echo "ok: dead model dropped, live kept" || { echo "FAIL: dead model dropped, live kept (got=$ch_out)"; fails=$((fails+1)); }
@@ -1652,17 +1685,7 @@ do_issue() {
       local issue_meta
       issue_meta="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json title,body,labels,number --jq '{n:.number,t:.title,b:.body,labs:[.labels[].name]}' 2>/dev/null)"
       local prompt
-      prompt=$(cat <<EOF
-/work $n
-
-Issue: #$n
-Title: $(echo "$issue_meta" | jq -r .t)
-Labels: $(echo "$issue_meta" | jq -r '.labs | join(", ")')
-
-Body:
-$(echo "$issue_meta" | jq -r .b)
-EOF
-)
+      prompt="$(build_work_prompt "$n" "$issue_meta")"
       if ! probe_gateway_model "$model"; then
         heartbeat "model $model dead (gateway probe fail), skipping to next"
         printf '\n[task-board-loop] probe failed: model=%s http=%s body=%s\n' \
@@ -1702,6 +1725,28 @@ EOF
         stop_heartbeat_poster "$n"
         trap - RETURN
         DONE=$((DONE+1))
+        return 0
+      fi
+      # #927: the agent may have marked the issue blocked after finishing every
+      # other step. Preserve that verdict - never turn a partial into status:done.
+      local final_json final_state final_labels
+      final_json="$(gh issue view "$n" -R "$TASK_BOARD_REPO" --json state,labels 2>/dev/null || echo '{}')"
+      final_state="$(printf '%s' "$final_json" | jq -r '.state // "OPEN"')"
+      final_labels="$(printf '%s' "$final_json" | jq -r '[.labels[].name] | join(",")')"
+      if [ "$final_state" != "OPEN" ]; then
+        heartbeat "agent closed #$n; leaving terminal state intact"
+        cleanup_worktree "$wt"
+        stop_heartbeat_poster "$n"
+        trap - RETURN
+        DONE=$((DONE+1))
+        return 0
+      fi
+      if [[ ",$final_labels," == *",$BLOCKED_LABEL,"* ]]; then
+        heartbeat "agent marked #$n blocked after partial completion; preserving"
+        if owns_claim "$n"; then unclaim "$n" "$BLOCKED_LABEL"; fi
+        stop_heartbeat_poster "$n"
+        trap - RETURN
+        BLOCKED=$((BLOCKED+1))
         return 0
       fi
       comment "$n" "task-board-loop: completed on attempt $((retry+1)) (model=$model, verified: log $(wc -c < "$logf")B + pushed branch \`$branch\`)"
