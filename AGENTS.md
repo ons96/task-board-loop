@@ -21,6 +21,11 @@ the preferred general-purpose worker because its runners have more CPU/RAM.
   must name the reason and whether a retry is appropriate.
 - `status:needs-user`: human action is required; workers must not retry it.
 
+Partial completion (#927): when one step needs user input, credentials, a
+  decision, or an unavailable external resource, skip only that step and finish
+  the rest. Then set `status:blocked` and comment `SKIP-BLOCKED: <exact input>`;
+  never mark the issue done for skipped work. The runner preserves that state.
+
 Transient provider, timeout, or infrastructure failures should be requeued
 with evidence when safe. Do not invent solutions to ambiguous requirements,
 missing credentials, destructive operations, or unavailable repository access.

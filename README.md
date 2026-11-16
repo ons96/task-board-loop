@@ -107,6 +107,10 @@ partial worktree, and strips recovery labels once the issue completes.
 
 ## Safety
 
+- Partial completion (#927): the `/work` prompt tells the agent to skip only a
+  blocked step, finish everything else, and mark the issue `status:blocked` with
+  the exact missing input. The runner preserves that verdict and never upgrades
+  a partial to `status:done`.
 - Never force-pushes
 - Never removes worktree with uncommitted changes (leaves for manual review)
 - Heartbeat file written every iteration; watchdog kills silent loops > 30min
